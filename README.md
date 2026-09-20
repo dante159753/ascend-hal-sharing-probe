@@ -9,6 +9,19 @@
 
 ## 编译
 
+### 原样保留的 Host UVA 共享文件
+
+`host_uva_share.cpp` 原样保存用户提供的文件，含换行和空白；SHA256 为 `1fcb4c0ea9d7674880601475a87d1831102a039438069a31e30f6e2aec37ff81`。另行提供 `common.h` 中的 SDK includes、日志和错误检查宏。该文件使用 C++20 指定成员初始化，CMake 为这个目标单独启用 C++20。
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target host_uva_share -j
+```
+
+该目标需要环境提供 `MEM_RSV_TYPE_HOST_UVA`。2026-09-20 在 A2 0.23.0/CANN 9.1.0 中编译失败，原因是已安装头文件没有这个定义；原参考 demo 的 `common.h` 也未定义该常量，需要实际构建环境提供其定义。程序没有将这个 flag 替换为其他值。为保持其他测试可编译，该目标不加入默认构建，需按上面命令单独构建。
+
+源码固定分配 2 GiB，writer 和 reader 分别手动运行。原程序的 goto 清理路径和校验失败后仍返回 0 的行为也原样保留；验证数据是否通过应检查 `Data verified OK!` 及错误日志，不能只看退出码。本次没有运行该程序。
+
 ### 单文件 Host 内存文件 I/O demo
 
 `hal_host_io.cpp` 可单独复制到目标机器编译，不依赖本仓库的其他文件或 CMake。仍需已安装的 CANN/HAL 开发头文件及库。
