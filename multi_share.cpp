@@ -163,27 +163,39 @@ static int worker(const MultiOptions& opt) {
 
         {
             AclResources acl;
-            check(aclrtMalloc(&acl.device, total, ACL_MEM_MALLOC_HUGE_FIRST), "allocate local NPU HBM");
+            check(aclrtMalloc(&acl.device, opt.bytes, ACL_MEM_MALLOC_HUGE_FIRST), "allocate one-block local NPU HBM");
             DVattribute attr{};
             check(drvMemGetAttribute(reinterpret_cast<DVdeviceptr>(acl.device), &attr), "query local HBM device");
             if (attr.devId != static_cast<uint32_t>(device)) throw std::runtime_error("ACL/HAL device ID mismatch");
             check(aclrtCreateStream(&acl.stream), "aclrtCreateStream");
             for (size_t writer = 0; writer < count; ++writer) {
-                uint64_t seed = 300 + writer;
                 if (writer == static_cast<size_t>(rank)) {
-                    fill(base, total, seed);
-                    check(aclrtMemcpyAsync(acl.device, total, base, total, ACL_MEMCPY_HOST_TO_DEVICE, acl.stream), "ACL async H2D full region");
-                    check(aclrtSynchronizeStream(acl.stream), "sync H2D");
-                    memset(base, 0, total);
-                    check(aclrtMemcpyAsync(base, total, acl.device, total, ACL_MEMCPY_DEVICE_TO_HOST, acl.stream), "ACL async D2H full region");
-                    check(aclrtSynchronizeStream(acl.stream), "sync D2H");
-                    verify(base, total, seed, "ACL_ASYNC_ROUNDTRIP_ALL_ALLOCATIONS");
+                    for (size_t owner = 0; owner < count; ++owner) {
+                        void* slice = static_cast<char*>(base) + owner * opt.bytes;
+                        uint64_t seed = 300 + writer * count + owner;
+                        printf("[pid=%d rank=%d] TEST ACL_ASYNC_BLOCK owner=%zu source=%s bytes=%zu\n",
+                               getpid(), rank, owner, owner == static_cast<size_t>(rank) ? "local" : "imported", opt.bytes);
+                        fill(slice, opt.bytes, seed);
+                        printf("[pid=%d rank=%d]   aclrtMemcpyAsync(dst=%p, dest_max=%zu, src=%p, count=%zu, kind=H2D, stream=%p)\n",
+                               getpid(), rank, acl.device, opt.bytes, slice, opt.bytes, acl.stream);
+                        check(aclrtMemcpyAsync(acl.device, opt.bytes, slice, opt.bytes, ACL_MEMCPY_HOST_TO_DEVICE, acl.stream), "ACL async H2D single block");
+                        check(aclrtSynchronizeStream(acl.stream), "sync H2D");
+                        memset(slice, 0, opt.bytes);
+                        printf("[pid=%d rank=%d]   aclrtMemcpyAsync(dst=%p, dest_max=%zu, src=%p, count=%zu, kind=D2H, stream=%p)\n",
+                               getpid(), rank, slice, opt.bytes, acl.device, opt.bytes, acl.stream);
+                        check(aclrtMemcpyAsync(slice, opt.bytes, acl.device, opt.bytes, ACL_MEMCPY_DEVICE_TO_HOST, acl.stream), "ACL async D2H single block");
+                        check(aclrtSynchronizeStream(acl.stream), "sync D2H");
+                        verify(slice, opt.bytes, seed, "ACL_ASYNC_ROUNDTRIP_SINGLE_BLOCK");
+                    }
                 }
                 barrier();
-                verify(base, total, seed, "PEER_SEES_D2H_WRITE");
+                for (size_t owner = 0; owner < count; ++owner) {
+                    void* slice = static_cast<char*>(base) + owner * opt.bytes;
+                    verify(slice, opt.bytes, 300 + writer * count + owner, "PEER_SEES_D2H_BLOCK_WRITE");
+                }
                 barrier();
             }
-            printf("CASE_PASS rank=%d ACL_ASYNC_H2D_D2H total_bytes=%zu\n", rank, total);
+            printf("CASE_PASS rank=%d ACL_ASYNC_H2D_D2H copy_bytes=%zu blocks=%zu\n", rank, opt.bytes, count);
         }
         barrier();
         // Unmap everywhere before any owner releases its allocation.
@@ -223,7 +235,7 @@ int main(int argc, char** argv) {
                      "One exec worker per device; equal NUMA Host allocations; independent local contiguous VA.\n"
                      "Each worker reserves with addr=null; virtual addresses need not match across processes.\n"
                      "VA base and reserved length are 1 GiB aligned; physical allocation sizes are unchanged.\n"
-                     "CPU, buffered AIO and ACL asynchronous H2D/D2H over the entire shared region.\n"
+                     "CPU/buffered AIO over the shared region; ACL async H2D/D2H copies one allocation per call.\n"
                      "Initialize with aclInit + aclrtSetDevice; HAL allocates/shares Host memory. No Direct IO.\n"
                      "Unset ASCEND_RT_VISIBLE_DEVICES; IDs refer to the HAL device namespace.\n"
                      "Use timeout -k 5 180 externally. Size is per process and must be a positive even MiB value.");

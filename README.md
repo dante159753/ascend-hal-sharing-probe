@@ -124,7 +124,7 @@ timeout -k 5 180 build/multi_share --devices 1,2,4 --numa-nodes 6,4,0 --size-mib
 
 - `--devices`：不重复的设备 ID，数量为 1～64；容器需暴露全部选中设备。
 - `--numa-nodes`：与设备列表一一对应的 Host NUMA 节点号。上例对应测试 A2，其他机器按实际拓扑填写。
-- `--size-mib`：**每个进程**的 Host 分配大小，默认 2 MiB，必须是正的 2 MiB 倍数。上例共分配 96 MiB Host 内存，每个进程都映射完整 96 MiB，并在自己的 NPU 上分配等大的测试 HBM。
+- `--size-mib`：**每个进程**的 Host 分配大小，默认 2 MiB，必须是正的 2 MiB 倍数。上例共分配 96 MiB Host 内存，每个进程都映射完整 96 MiB，并在自己的 NPU 上分配单块大小（32 MiB）的测试 HBM。
 - `--io-dir`：已有、可写的测试目录。只执行 buffered Linux AIO，文件打开后立即 unlink，不测试 Direct I/O。
 
 取消 `ASCEND_RT_VISIBLE_DEVICES`，避免 HAL 和 ACL 设备编号重排。程序会查询每个工作进程分配的 HBM 的 HAL device ID，确认与所选设备一致。
@@ -135,7 +135,7 @@ CPU affinity 绑定到所选 NUMA 节点与当前允许 CPU 集的交集。Host 
 
 日志 `LOCAL_VA` 分别打印各进程的 `base`、`total_bytes`（实际数据长度）、`reserve_bytes`（对齐后的 VA 长度）和 `va_alignment`。例如三进程各 32 MiB，实际共享数据为 96 MiB，每个进程预留 1 GiB VA；额外 VA 不做物理内存分配或映射。交换 handle 后，其他进程的内存通过 `halGetHostID` 返回的 Host ID 导入，按 `local_base + owner_rank × bytes_each` 逐块映射。每个进程内部仍连续；不同进程通过相同块序号和块内偏移访问同一份共享数据，不能直接交换本地指针。驱动可能恰好返回相同地址，程序不依赖这一点。
 
-CPU、AIO、H2D/D2H 都覆盖整个连续区域及映射边界。每个进程轮流写入，所有进程完整校验，避免数据竞争。异步 H2D 完成后清空 Host 区域，再 D2H 回写并完整校验；其他进程随后验证能看到本次 D2H 写入。释放 stream/HBM、全部共享映射、handle 和 VA 后，各进程执行 `aclrtResetDevice(device_id) → aclFinalize()`；不对 SetDevice 创建的默认 context 调用 `aclrtDestroyContext`。
+CPU、AIO 覆盖整个连续区域。ACL H2D/D2H 每次仅拷贝一个 owner 的分配块，大小为 `--size-mib`；不在一次 copy 中跨越自己的块和其他进程的块。各卡轮流逐块执行 H2D，等待完成后清空该 Host 块，再 D2H 回写并校验；不同块使用不同数据模式，其他进程逐块验证可见性。日志打印 owner、本地/导入来源、源/目的地址及单次拷贝长度。释放 stream/HBM、全部共享映射、handle 和 VA 后，各进程执行 `aclrtResetDevice(device_id) → aclFinalize()`；不对 SetDevice 创建的默认 context 调用 `aclrtDestroyContext`。
 
 2026-09-20 使用当前 `aclInit + aclrtSetDevice` 版本，在 A2 910B3、vLLM-Ascend 0.23.0、CANN 9.1.0、驱动 25.5.2 上实测（测试时卡 4 已有 vLLM 进程）：
 
@@ -147,7 +147,7 @@ CPU、AIO、H2D/D2H 都覆盖整个连续区域及映射边界。每个进程轮
 | buffered AIO 读写及完整数据校验 | 通过 | 通过 |
 | 各卡 ACL 异步 H2D/D2H，其他进程验证 D2H 结果 | 通过 | 通过 |
 
-独立选址版本在 A2 复测上述两组均通过，均输出 `MULTI_RESULT PASS ... va_mode=independent`，退出码为 0。各进程 `reserve_bytes=1073741824`，实际数据长度分别为 6 MiB 和 96 MiB。本次驱动自动返回的本地基址恰好均为 `0x12c180000000`；所有预留调用都传 `addr=nullptr`，不依赖基址相等，但本次没有覆盖数值不同的基址。A5 尚需实机验证。旧 `--copy-api` 诊断选项已移除。
+独立选址、单块 ACL 拷贝版本在 A2 复测上述两组均通过，均输出 `MULTI_RESULT PASS ... va_mode=independent`，退出码为 0。各进程 `reserve_bytes=1073741824`，实际数据长度分别为 6 MiB 和 96 MiB。本次驱动自动返回的本地基址恰好均为 `0x12c180000000`；所有预留调用都传 `addr=nullptr`，不依赖基址相等，但本次没有覆盖数值不同的基址。A5 尚需实机验证。旧 `--copy-api` 诊断选项已移除。
 
 ## 一键运行两种模式
 
