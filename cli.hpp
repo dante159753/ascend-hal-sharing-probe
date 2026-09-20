@@ -10,7 +10,6 @@ struct Options {
     size_t bytes = 2 * 1024 * 1024;
     std::string io_dir = ".";
     std::string aio = "both";
-    bool via_host = false;
 };
 inline Options options;
 
@@ -50,12 +49,10 @@ inline int launch(int argc, char** argv, int (*worker)(bool, int, size_t)) {
             if (key == "--help") {
                 puts("Options: --device ACL_LOGICAL_ID --size-mib EVEN_MIB --io-dir DIR\n"
                      "         --aio both|buffered|direct|none (host_share only)\n"
-                     "         --via-host (device_share: import Host then SetAccess Device)\n"
                      "Default: device 0, size 2 MiB, current IO directory, both AIO modes.\n"
                      "Return: 0 all requested cases pass; 1 a case fails; 2 usage/launch error.");
                 return 0;
             }
-            if (key == "--via-host") { options.via_host = true; continue; }
             if (++i == argc) throw std::runtime_error("missing option value");
             std::string value = argv[i];
             if (key == "--device" || key == "--worker-fd") {

@@ -15,12 +15,11 @@ def main():
     parser.add_argument("--build-dir", type=pathlib.Path, default=pathlib.Path("build"))
     parser.add_argument("--log-dir", type=pathlib.Path)
     parser.add_argument("--io-dir", type=pathlib.Path, required=True)
-    parser.add_argument("--device", type=int, default=0, help="ACL logical device ID")
+    parser.add_argument("--device", type=int, default=0, help="ACL logical device ID for host suite; device suite is fixed to HAL 0")
     parser.add_argument("--hal-device", type=int, default=0, help="HAL device ID for pure-HAL diagnostics")
     parser.add_argument("--sizes-mib", type=int, nargs="+", default=[2, 32])
     parser.add_argument("--suite", choices=["all", "host", "device", "hal"], default="all")
     parser.add_argument("--aio", choices=["both", "buffered", "direct", "none"], default="both")
-    parser.add_argument("--via-host", action="store_true", help="add Host import + SetAccess Device control")
     parser.add_argument("--timeout", type=int, default=120, help="seconds per case, including both processes")
     args = parser.parse_args()
     if args.timeout <= 0 or min(args.device, args.hal_device) < 0 or any(n <= 0 or n % 2 for n in args.sizes_mib):
@@ -29,6 +28,10 @@ def main():
         parser.error("--io-dir must be an existing writable filesystem directory")
     if len(set(args.sizes_mib)) != len(args.sizes_mib):
         parser.error("duplicate sizes are not allowed")
+    if args.suite in ("all", "device") and args.device != 0:
+        parser.error("device suite is fixed to HAL device 0; use --suite host for other ACL devices")
+    if args.suite in ("all", "device") and "ASCEND_RT_VISIBLE_DEVICES" in os.environ:
+        parser.error("unset ASCEND_RT_VISIBLE_DEVICES; device suite uses HAL device 0")
     build = args.build_dir.resolve()
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     logs = args.log_dir or pathlib.Path("logs") / f"{stamp}-{os.getpid()}"
@@ -39,9 +42,7 @@ def main():
         if args.suite in ("all", "host"):
             cases.append((f"host-{size}MiB", [str(build / "host_share"), *common, "--io-dir", str(args.io_dir.resolve()), "--aio", args.aio]))
         if args.suite in ("all", "device"):
-            cases.append((f"device-{size}MiB", [str(build / "device_share"), *common]))
-            if args.via_host:
-                cases.append((f"device-via-host-{size}MiB", [str(build / "device_share"), *common, "--via-host"]))
+            cases.append((f"device-{size}MiB", [str(build / "device_share"), "--size-mib", str(size)]))
     if args.suite in ("all", "hal"):
         for side in ("host", "device"):
             cases.append((f"hal-map-{side}", [str(build / "hal_map_probe"), side, str(args.hal_device), str(args.sizes_mib[0])]))

@@ -3,9 +3,9 @@
 用于在 A5/Ascend 950 等环境验证同一台机器上两种共享方式：
 
 1. **Host → Host**：进程 A 用 HAL 分配 Host DDR，进程 B 导入为 Host。双方 CPU 读写同一块内存，双方分别执行 ACL 异步 H2D/D2H，以及 buffered / O_DIRECT Linux AIO。
-2. **Host → Device**：进程 B 将 A 的 Host DDR 导入为其 NPU 的 Device 映射，执行 `aclrtMemcpyAsync(..., ACL_MEMCPY_DEVICE_TO_DEVICE)` 到 B 的 NPU HBM，再回读逐项校验；还测试反向 D2D 写回，让 A 的 CPU 验证。
+2. **Host → Device**：`device_share` 使用 TSD/HAL 初始化设备 0，将 A 的 Host DDR 导入为设备 0 的映射，通过 `halMemcpy` 写入和读回校验，对齐原始 dev-shm demo 的路径。
 
-**这是能力探测程序，失败会返回非零退出码和具体阶段。A5 尚未实机验证，不能把“能编译”当成“接口支持”。** 不修改驱动、模型、UCM 或设备配置。完整测试使用 ACL 初始化；另有纯 HAL 初始化/映射诊断，避免混用两种初始化方式。
+**这是能力探测程序，失败会返回非零退出码和具体阶段。A5 尚未实机验证，不能把“能编译”当成“接口支持”。** 不修改驱动、模型、UCM 或设备配置。`host_share` 和 `multi_share` 使用 ACL 初始化；`device_share` 使用 TSD/HAL 初始化。
 
 ## 编译
 
@@ -27,9 +27,36 @@ export LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/d
 ldd build/device_share
 ```
 
-确认 `libascend_hal.so` 来自实际驱动目录，`libascendcl.so` / `libruntime.so` 来自所选 CANN。CMake 不搜索 toolkit 中的 HAL stub 库。自定义安装路径用 `CANN_ROOT` / `DRIVER_ROOT` 指定，也需相应调整环境变量。
+确认 `libascend_hal.so` 来自实际驱动目录。`device_share` 不链接 `libascendcl.so` / `libruntime.so`；运行时需能找到 CANN 的 `libtsdclient.so`。其他 ACL 测试的库应来自所选 CANN。CMake 不搜索 toolkit 中的 HAL stub 库。自定义安装路径用 `CANN_ROOT` / `DRIVER_ROOT` 指定，也需相应调整环境变量。
 
 在容器中运行时使用 **vLLM-Ascend 0.23.0 或更新且适配 A5 的镜像**，挂载本机驱动、目标设备节点及 ext4/XFS 测试目录；不要挂载其他版本 toolkit 覆盖镜像。具体容器设备授权按机器已有运维配置执行。测试程序不需要访问所有 NPU。
+
+## Device 共享：TSD/HAL 初始化和 HAL 拷贝
+
+```bash
+git pull --ff-only origin main
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+export LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64/driver:${LD_LIBRARY_PATH:-}
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target device_share -j
+unset ASCEND_RT_VISIBLE_DEVICES
+timeout -k 5 120 build/device_share --size-mib 2
+```
+
+两个进程都固定使用 **HAL device 0**，导入目标也是 0。可省略 `--device`，若显式传入则只接受 `--device 0`。`--size-mib` 默认为 2，必须为正的 2 MiB 倍数。旧的 `--via-host` 已移除。
+
+流程为：
+
+1. 每个独立 exec 进程执行 `TsdOpen(0, 0) → halSetRuntimeApiVer → halDeviceOpen(0)`。
+2. Writer 按 `MEM_HOST_SIDE, devid=0, module_id=0, MEM_HUGE_PAGE_TYPE, MEM_DDR_TYPE` 分配并映射 Host DDR。
+3. Writer 只在普通 Host buffer 里生成数据，通过 `halMemcpy` 写入共享映射；`memcpy_info.dir=DRV_MEMCPY_HOST_TO_DEVICE`、`devid=0`。
+4. 导出 handle 并启用同服务器共享权限。Reader 执行 Reserve → `halMemImportFromShareableHandle(handle, 0, ...)` → Map。
+5. Reader 通过 `halMemcpy` 将映射内容读到普通 Host buffer；`dir=DRV_MEMCPY_DEVICE_TO_HOST`、`devid=0`，随后逐项校验全部数据。
+6. Reader 释放映射和导入 handle 后，Writer 才释放原始分配；最后各自关闭 HAL 和 TSD。
+
+不直接解引用共享映射，不分配 NPU HBM，不调用 ACL，不执行 D2D/AIO。HAL memcpy 使用非空 `memcpy_info`，不静默切换拷贝方向或退回 CPU 拷贝。任一 HAL 调用或数据校验失败均返回非零；成功应看到 `PASS HAL_SHARED_DATA` 和双方 `RESULT PASS`。
+
+2026-09-20 在 A2 的 0.23.0/CANN 9.1.0 容器中编译和参数检查通过，确认可执行文件不链接 ACL/runtime。由于 A2 卡 0 有其他进程，本次没有运行固定设备 0 的硬件用例；A5 结果需在目标环境验证。
 
 ## 多卡 NUMA Host 共享 demo
 
@@ -82,20 +109,21 @@ CPU、AIO、H2D/D2H 都覆盖整个连续区域及映射边界。每个进程轮
 mkdir -p "$HOME/hal-probe-io"
 findmnt -T "$HOME/hal-probe-io" -o TARGET,SOURCE,FSTYPE
 
-ASCEND_RT_VISIBLE_DEVICES=0 python3 run_tests.py \
+unset ASCEND_RT_VISIBLE_DEVICES
+python3 run_tests.py \
   --device 0 --hal-device 0 \
   --io-dir "$HOME/hal-probe-io" \
-  --sizes-mib 2 32 --via-host
+  --sizes-mib 2 32
 ```
 
-默认运行 Host、Device 两类完整测试，以及纯 HAL 的 Host/Device 映射诊断。`--via-host` 额外运行“先导入 Host，再 SetAccess Device”的对照路径。每例默认超时 120 秒，超时会终止该例两个进程所在进程组；其他用例继续。日志写入 `logs/<时间>-<PID>/`，`summary.json` 保存命令和退出码。可用 `--log-dir` 指定一个尚不存在的新目录。
+默认运行 Host、Device 两类完整测试，以及纯 HAL 的 Host/Device 映射诊断。`device` suite 固定使用 HAL 设备 0，不受 runner 的 `--device` 参数影响。每例默认超时 120 秒，超时会终止该例两个进程所在进程组；其他用例继续。日志写入 `logs/<时间>-<PID>/`，`summary.json` 保存命令和退出码。可用 `--log-dir` 指定一个尚不存在的新目录。
 
 两个设备参数不是同一命名空间：
 
-- `--device`：ACL 可见逻辑序号。完整 Device 测试从实际分配的 NPU HBM 查询 HAL `devId`，用它做导入目标。
+- `--device`：仅用于 Host suite 的 ACL 可见逻辑序号。Device suite 固定使用 HAL device 0。
 - `--hal-device`：纯 HAL 诊断的 HAL 设备编号；不经 ACL 可见设备列表重编号。
 
-例如选择物理 NPU 1 时，在普通未重编号的驱动环境中使用 `ASCEND_RT_VISIBLE_DEVICES=1 --device 0 --hal-device 1`。如果容器或驱动另有编号映射，以本机实际 HAL 编号为准。
+选择其他卡测试时单独运行 `--suite host` 或 `--suite hal`；`--suite device` 和 `--suite all` 包含固定设备 0 的用例，并要求取消 `ASCEND_RT_VISIBLE_DEVICES`。
 
 **O_DIRECT 必须在支持它的文件系统中测试。** 不要把 `--io-dir` 指向 tmpfs（常见的 `/tmp`、`/dev/shm`）。程序只创建本例 PID 命名的临时文件，并在打开后立即 unlink；不删除目录内已有数据。
 
@@ -110,13 +138,9 @@ ASCEND_RT_VISIBLE_DEVICES=0 timeout -k 5 120 build/host_share \
 ASCEND_RT_VISIBLE_DEVICES=0 timeout -k 5 120 build/host_share \
   --device 0 --size-mib 32 --io-dir "$HOME/hal-probe-io" --aio buffered
 
-# Host 导入为 Device，再 ACL async D2D 到该 NPU 的 HBM
-ASCEND_RT_VISIBLE_DEVICES=0 timeout -k 5 120 build/device_share \
-  --device 0 --size-mib 2
-
-# 替代路径：Host 导入 + SetAccess Device RW
-ASCEND_RT_VISIBLE_DEVICES=0 timeout -k 5 120 build/device_share \
-  --device 0 --size-mib 2 --via-host
+# 固定设备 0：HAL H2D 写入、Device 导入、HAL D2H 读回
+unset ASCEND_RT_VISIBLE_DEVICES
+timeout -k 5 120 build/device_share --size-mib 2
 
 # 跟参考 demo 一致的纯 HAL 初始化/导入顺序，不链接 ACL/runtime
 timeout -k 5 120 build/hal_map_probe host 0 2
@@ -133,7 +157,7 @@ timeout -k 5 120 build/hal_map_probe device 0 2
 
 `host_share`：A 写入模式 101，B 全量验证并写入 202，A 全量验证。随后 A、B 分别测试各自映射的 ACL H2D/D2H；H2D 完成后清空 Host buffer，D2H 完成后逐项验证。32 次连续提交后查询事件、等待完成并记录耗时；事件 `NOT_READY` 是本次确实未完成的证据，立即完成本身不算功能失败。双方还执行原生 Linux AIO：四个对齐请求分别测试读和写，记录每个完成事件；普通对齐内存作相同文件的对照。AIO 写入使用不同于文件原内容的数据模式并回读验证。后续双方再互相验证共享数据。
 
-`device_share`：A CPU 写入 → B 导入 Device → D2D 到新分配 HBM → D2H 到普通 CPU buffer 校验；A 修改原始 Host 数据后再验证一次，证明导入是共享映射；最后从 B 的 HBM 反向 D2D 写回共享地址，A CPU 验证。Device VA 不直接被 CPU 解引用。物理共享内存仍在 Host DDR，导入不会将它搬到 HBM。
+`device_share`：普通 Host buffer → HAL H2D → 共享 Host DDR；另一进程按设备 0 导入后，HAL D2H → 普通 Host buffer 校验。物理共享内存始终在 Host DDR。详细步骤见上面的 Device 共享章节。
 
 `hal_map_probe`：只调用 **halSetRuntimeApiVer → halDeviceOpen → Reserve → Import/Create → Map** 等 HAL 接口。Host 模式附带 CPU 双向共享校验；Device 模式只确认映射成功，**其 PASS 不代表 D2D 可用**。不会在 HAL 初始化后再混入 ACL 初始化。
 
@@ -147,7 +171,7 @@ timeout -k 5 120 build/hal_map_probe device 0 2
 
 ## 已知 A2 对照
 
-此前在 A2 910B3、驱动 25.5.2/HAL 7.35.23、vLLM-Ascend 0.23.0/CANN 9.1.0 上：ACL 初始化的 Host 共享 CPU/ACL/buffered AIO 通过；O_DIRECT AIO 返回 EFAULT；Device 直接导入返回 8；Host 导入后 SetAccess Device 返回 65534。旧 `hal_map_probe` 未调用 `TsdOpen`，其 DeviceOpen 返回 4；补齐 TSD 启动后 DeviceOpen 成功；当前 `multi_share` 通过显式 ACL context 统一完成设备初始化。这些是 A2 对照，不是 A5 预期结果。
+此前在 A2 910B3、驱动 25.5.2/HAL 7.35.23、vLLM-Ascend 0.23.0/CANN 9.1.0 上：ACL 初始化的 Host 共享 CPU/ACL/buffered AIO 通过；O_DIRECT AIO 返回 EFAULT；旧 ACL 初始化版本的 Device 直接导入返回 8；旧 Host 导入后 SetAccess Device 对照返回 65534。这不是当前固定设备 0 的 HAL 拷贝版本的运行结果。旧 `hal_map_probe` 未调用 `TsdOpen`，其 DeviceOpen 返回 4；补齐 TSD 启动后 DeviceOpen 成功；当前 `multi_share` 通过显式 ACL context 统一完成设备初始化。这些是 A2 对照，不是 A5 预期结果。
 
 ## 参考
 
