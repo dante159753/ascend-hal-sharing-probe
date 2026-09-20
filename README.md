@@ -3,7 +3,7 @@
 用于在 A5/Ascend 950 等环境验证同一台机器上两种共享方式：
 
 1. **Host → Host**：进程 A 用 HAL 分配 Host DDR，进程 B 导入为 Host。双方 CPU 读写同一块内存，双方分别执行 ACL 异步 H2D/D2H，以及 buffered / O_DIRECT Linux AIO。
-2. **Host → Device**：`device_share` 使用 TSD/HAL 初始化设备 0，将 A 的 Host DDR 导入为设备 0 的映射，通过 `halMemcpy` 写入和读回校验，对齐原始 dev-shm demo 的路径。
+2. **Host → Device**：`device_share` 使用 TSD/HAL 初始化设备 0，将 A 的 Host DDR 导入为设备 0 的映射，独立分配 HBM，验证 Host 源 H2D、导入映射与 HBM 的双向 D2D 和跨进程写回。Host DDR 和 HBM 均使用普通页。
 
 **这是能力探测程序，失败会返回非零退出码和具体阶段。A5 尚未实机验证，不能把“能编译”当成“接口支持”。** 不修改驱动、模型、UCM 或设备配置。`host_share` 和 `multi_share` 使用 ACL 初始化；`device_share` 使用 TSD/HAL 初始化。
 
@@ -43,18 +43,19 @@ unset ASCEND_RT_VISIBLE_DEVICES
 timeout -k 5 120 build/device_share --size-mib 2
 ```
 
-两个进程都固定使用 **HAL device 0**，导入目标也是 0。可省略 `--device`，若显式传入则只接受 `--device 0`。`--size-mib` 默认为 2，必须为正的 2 MiB 倍数。旧的 `--via-host` 已移除。
+两个进程都固定使用 **HAL device 0**，导入目标也是 0。可省略 `--device`，若显式传入则只接受 `--device 0`。`--size-mib` 默认为 2，接受任意正整数 MiB（包括 1、3）。旧的 `--via-host` 已移除。
 
 流程为：
 
 1. 每个独立 exec 进程执行 `TsdOpen(0, 0) → halSetRuntimeApiVer → halDeviceOpen(0)`。
-2. Writer 按 `MEM_HOST_SIDE, devid=0, module_id=0, MEM_HUGE_PAGE_TYPE, MEM_DDR_TYPE` 分配并映射 Host DDR。
-3. Writer 只在普通 Host buffer 里生成数据，通过 `halMemcpy` 写入共享映射；`memcpy_info.dir=DRV_MEMCPY_HOST_TO_DEVICE`、`devid=0`。
-4. 导出 handle 并启用同服务器共享权限。Reader 执行 Reserve → `halMemImportFromShareableHandle(handle, 0, ...)` → Map。
-5. Reader 通过 `halMemcpy` 将映射内容读到普通 Host buffer；`dir=DRV_MEMCPY_DEVICE_TO_HOST`、`devid=0`，随后逐项校验全部数据。
-6. Reader 释放映射和导入 handle 后，Writer 才释放原始分配；最后各自关闭 HAL 和 TSD。
+2. Creator 按 `MEM_HOST_SIDE, devid=0, module_id=0, MEM_NORMAL_PAGE_TYPE, MEM_DDR_TYPE` 分配并映射 Host DDR，由 CPU 写入模式 101。两个进程还各自独立分配 HBM，属性为 `MEM_DEV_SIDE, devid=0, MEM_NORMAL_PAGE_TYPE, MEM_HBM_TYPE`；均使用 Reserve → Create → Map。
+3. Creator 执行 `halMemcpy(HBM目的, bytes, 共享Host源, bytes, H2D信息)`，再 D2H 到普通 Host 校验 buffer，全量校验模式 101。
+4. 导出 handle 并启用同服务器共享权限。Importer 执行 Reserve → `halMemImportFromShareableHandle(handle, 0, ...)` → Map。
+5. Importer 将导入的 Device 映射 D2D 拷贝到自己的 HBM，再 D2H 到普通 Host buffer，校验模式 101。
+6. Importer 在普通 Host buffer 中生成模式 202，H2D 到 HBM，再 D2D 到导入的共享映射（此时共享映射是目的地址）。D2H 读回该映射校验，通知 Creator 通过 CPU 校验共享 Host DDR 已变为模式 202。
+7. Importer 释放映射和导入 handle 后，Creator 才释放原始分配；各自释放 HBM，最后关闭 HAL 和 TSD。
 
-不直接解引用共享映射，不分配 NPU HBM，不调用 ACL，不执行 D2D/AIO。HAL memcpy 使用非空 `memcpy_info`，不静默切换拷贝方向或退回 CPU 拷贝。任一 HAL 调用或数据校验失败均返回非零；成功应看到 `PASS HAL_SHARED_DATA` 和双方 `RESULT PASS`。
+Creator 可由 CPU 读写原始 Host 映射；Importer 不直接解引用 Device 映射。所有内存拷贝使用 HAL，不调用 ACL，不执行 AIO。`memcpy_info` 非空，`devid=0`，每次显式设置方向，不自动降级或回退大页。成功应看到 `PASS CREATOR_HOST_TO_HBM`、`PASS IMPORTER_SHARED_TO_HBM`、`PASS IMPORTER_WRITE_READBACK`、`PASS CREATOR_SEES_IMPORTER_WRITE` 和双方 `RESULT PASS`。
 
 2026-09-20 在 A2 的 0.23.0/CANN 9.1.0 容器中编译和参数检查通过，确认可执行文件不链接 ACL/runtime。由于 A2 卡 0 有其他进程，本次没有运行固定设备 0 的硬件用例；A5 结果需在目标环境验证。
 
@@ -138,7 +139,7 @@ ASCEND_RT_VISIBLE_DEVICES=0 timeout -k 5 120 build/host_share \
 ASCEND_RT_VISIBLE_DEVICES=0 timeout -k 5 120 build/host_share \
   --device 0 --size-mib 32 --io-dir "$HOME/hal-probe-io" --aio buffered
 
-# 固定设备 0：HAL H2D 写入、Device 导入、HAL D2H 读回
+# 固定设备 0：普通页 Host 源 H2D 到独立 HBM、Device 导入后双向 D2D
 unset ASCEND_RT_VISIBLE_DEVICES
 timeout -k 5 120 build/device_share --size-mib 2
 
@@ -147,17 +148,17 @@ timeout -k 5 120 build/hal_map_probe host 0 2
 timeout -k 5 120 build/hal_map_probe device 0 2
 ```
 
-`--size-mib` 必须为正的 2 MiB 倍数。程序默认设备 0；直接运行二进制时建议使用外部 `timeout`，批量脚本已经管理超时。完整程序不会自动降级到另一种拷贝方向或另一条初始化路径。
+`device_share` 的 `--size-mib` 接受任意正整数；其他程序仍要求正的 2 MiB 倍数。批量脚本单独选择 `--suite device` 时也接受奇数 MiB。程序默认设备 0；直接运行二进制时建议使用外部 `timeout`，批量脚本已经管理超时。完整程序不会自动降级到另一种拷贝方向或另一条初始化路径。
 
 ## 测试步骤与结果解释
 
 所有程序在初始化运行时前 fork，子进程随后 exec，因此导入进程不继承创建者的 HAL 映射。Unix socket 仅传递共享 handle 和同步消息，不传 buffer 数据。两个映射同时存在，读写按消息协调，避免无同步的数据竞争。测试使用同机共享授权 `SHR_HANDLE_ATTR_NO_WLIST_IN_SERVER`，临时共享 handle 仅发给子进程；生产应用可改为 PID 白名单。
 
-分配属性是 `MEM_HOST_SIDE, devid=0, module_id=0, MEM_HUGE_PAGE_TYPE, MEM_DDR_TYPE, reserve=0`。Host 导入目标通过 `halGetHostID` 查询，不硬编码 65。导入顺序统一为 **Reserve → Import → Map**，所有 VMM offset/flags 为 0。不调用 HostRegister。
+`host_share` 的分配属性是 `MEM_HOST_SIDE, devid=0, module_id=0, MEM_HUGE_PAGE_TYPE, MEM_DDR_TYPE, reserve=0`。Host 导入目标通过 `halGetHostID` 查询，不硬编码 65。导入顺序统一为 **Reserve → Import → Map**，所有 VMM offset/flags 为 0。不调用 HostRegister。
 
 `host_share`：A 写入模式 101，B 全量验证并写入 202，A 全量验证。随后 A、B 分别测试各自映射的 ACL H2D/D2H；H2D 完成后清空 Host buffer，D2H 完成后逐项验证。32 次连续提交后查询事件、等待完成并记录耗时；事件 `NOT_READY` 是本次确实未完成的证据，立即完成本身不算功能失败。双方还执行原生 Linux AIO：四个对齐请求分别测试读和写，记录每个完成事件；普通对齐内存作相同文件的对照。AIO 写入使用不同于文件原内容的数据模式并回读验证。后续双方再互相验证共享数据。
 
-`device_share`：普通 Host buffer → HAL H2D → 共享 Host DDR；另一进程按设备 0 导入后，HAL D2H → 普通 Host buffer 校验。物理共享内存始终在 Host DDR。详细步骤见上面的 Device 共享章节。
+`device_share`：共享 Host DDR → HAL H2D → 独立 HBM；另一进程按设备 0 导入后，验证共享映射与独立 HBM 的双向 D2D，并 D2H 读回校验。物理共享内存始终在 Host DDR，另行申请的 HBM 是不同的物理内存。详细步骤见上面的 Device 共享章节。
 
 `hal_map_probe`：只调用 **halSetRuntimeApiVer → halDeviceOpen → Reserve → Import/Create → Map** 等 HAL 接口。Host 模式附带 CPU 双向共享校验；Device 模式只确认映射成功，**其 PASS 不代表 D2D 可用**。不会在 HAL 初始化后再混入 ACL 初始化。
 

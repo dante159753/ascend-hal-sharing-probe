@@ -22,8 +22,9 @@ def main():
     parser.add_argument("--aio", choices=["both", "buffered", "direct", "none"], default="both")
     parser.add_argument("--timeout", type=int, default=120, help="seconds per case, including both processes")
     args = parser.parse_args()
-    if args.timeout <= 0 or min(args.device, args.hal_device) < 0 or any(n <= 0 or n % 2 for n in args.sizes_mib):
-        parser.error("devices must be nonnegative; timeout positive; sizes positive multiples of 2 MiB")
+    alignment_mib = 1 if args.suite == "device" else 2
+    if args.timeout <= 0 or min(args.device, args.hal_device) < 0 or any(n <= 0 or n % alignment_mib for n in args.sizes_mib):
+        parser.error(f"devices must be nonnegative; timeout positive; sizes positive multiples of {alignment_mib} MiB")
     if not args.io_dir.is_dir():
         parser.error("--io-dir must be an existing writable filesystem directory")
     if len(set(args.sizes_mib)) != len(args.sizes_mib):

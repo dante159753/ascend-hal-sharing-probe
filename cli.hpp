@@ -40,7 +40,7 @@ inline unsigned long long number(const std::string& text) {
         throw std::runtime_error("expected a nonnegative integer");
     return std::stoull(text);
 }
-inline int launch(int argc, char** argv, int (*worker)(bool, int, size_t)) {
+inline int launch(int argc, char** argv, int (*worker)(bool, int, size_t), size_t alignment_mib = 2) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     int worker_fd = -1;
     try {
@@ -62,8 +62,8 @@ inline int launch(int argc, char** argv, int (*worker)(bool, int, size_t)) {
                 else worker_fd = static_cast<int>(n);
             } else if (key == "--size-mib") {
                 auto n = number(value);
-                if (!n || n % 2 || n > SIZE_MAX / (1024 * 1024))
-                    throw std::runtime_error("size must be a positive multiple of 2 MiB");
+                if (!n || n % alignment_mib || n > SIZE_MAX / (1024 * 1024))
+                    throw std::runtime_error("size must be a positive multiple of " + std::to_string(alignment_mib) + " MiB");
                 options.bytes = n * 1024 * 1024;
             } else if (key == "--io-dir") options.io_dir = value;
             else if (key == "--aio") {
