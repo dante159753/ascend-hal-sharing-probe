@@ -72,7 +72,7 @@ int32_t RunWriter(const char *prog, int32_t device)
     uint64_t shareableHandle = 0;
     struct ShareHandleAttr wlistAttr = {.enableFlag = SHR_HANDLE_NO_WLIST_ENABLE, .rsv = {0}};
  
-    CHECK_GOTO(halMemAddressReserve(&va, kShmSize, 0, nullptr, MEM_RSV_TYPE_HOST_UVA), finished);
+    CHECK_GOTO(halMemAddressReserve(&va, kShmSize, 0, nullptr, MEM_NORMAL_PAGE_TYPE), finished);
     LOG_INFO("Reserve address at %p", va);
     CHECK_GOTO(halMemCreate(&handle, kShmSize, &prop, 0), free_va);
     LOG_INFO("Created Host DRAM physical memory (huge page, %lu bytes).", kShmSize);
@@ -120,7 +120,7 @@ int32_t RunReader(int32_t device, uint64_t shareableHandle)
     drv_mem_handle_t *handle = nullptr;
     void *verify = nullptr;
  
-    CHECK_GOTO(halMemAddressReserve(&va, kShmSize, 0, nullptr, MEM_RSV_TYPE_HOST_UVA), finished);
+    CHECK_GOTO(halMemAddressReserve(&va, kShmSize, 0, nullptr, MEM_NORMAL_PAGE_TYPE), finished);
     LOG_INFO("Reserve address at %p", va);
     CHECK_GOTO(halMemImportFromShareableHandle(shareableHandle, device, &handle), free_va);
     LOG_INFO("Imported shareable handle: %lu.", shareableHandle);
