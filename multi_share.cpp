@@ -7,6 +7,8 @@
 #include <set>
 #include <sstream>
 
+static constexpr size_t va_alignment = size_t{1} << 30;
+
 struct MultiOptions {
     std::vector<int> devices, nodes;
     size_t bytes = 2 * 1024 * 1024;
@@ -79,6 +81,7 @@ static void buffered_aio(void* ptr, size_t bytes, uint64_t seed, const std::stri
 
 static int worker(const MultiOptions& opt) {
     const size_t count = opt.devices.size(), total = opt.bytes * count;
+    const size_t reserve_bytes = (total + va_alignment - 1) & ~(va_alignment - 1);
     const int rank = opt.rank, device = opt.devices[rank], node = opt.nodes[rank];
     bool acl_init = false, device_set = false;
     void* base = nullptr;
@@ -101,14 +104,27 @@ static int worker(const MultiOptions& opt) {
         printf("CONTEXT rank=%d pid=%d device=%d ptr=%p init=aclrtSetDevice\n", rank, getpid(), current_device, current);
 
         if (rank == 0) {
-            check(halMemAddressReserve(&base, total, 0, nullptr, 0), "reserve coordinator-selected VA");
+            printf("[pid=%d rank=%d]   CALL halMemAddressReserve(size=%zu, alignment=0, addr=null, flags=0) data_bytes=%zu\n",
+                   getpid(), rank, reserve_bytes, total);
+            check(halMemAddressReserve(&base, reserve_bytes, 0, nullptr, 0), "reserve coordinator-selected VA");
+            printf("[pid=%d rank=%d]     OUTPUT base=%p required_alignment=%zu\n", getpid(), rank, base, va_alignment);
+            // A >=1 GiB reserve selects the driver's 1 GiB VA alignment; never round a live allocation's pointer.
+            if (reinterpret_cast<uintptr_t>(base) % va_alignment)
+                throw std::runtime_error("automatically reserved base is not 1 GiB aligned");
             send_word(opt.fd, reinterpret_cast<uint64_t>(base));
         }
         auto common_base = receive_word(opt.fd);
-        if (rank != 0)
-            check(halMemAddressReserve(&base, total, 0, reinterpret_cast<void*>(common_base), 0), "reserve identical VA");
+        if (!common_base || common_base % va_alignment)
+            throw std::runtime_error("common base is null or not 1 GiB aligned");
+        if (rank != 0) {
+            printf("[pid=%d rank=%d]   CALL halMemAddressReserve(size=%zu, alignment=0, addr=%p, flags=0) data_bytes=%zu\n",
+                   getpid(), rank, reserve_bytes, reinterpret_cast<void*>(common_base), total);
+            check(halMemAddressReserve(&base, reserve_bytes, 0, reinterpret_cast<void*>(common_base), 0), "reserve identical VA");
+            printf("[pid=%d rank=%d]     OUTPUT base=%p\n", getpid(), rank, base);
+        }
         if (reinterpret_cast<uint64_t>(base) != common_base) throw std::runtime_error("base address differs");
-        printf("COMMON_VA rank=%d base=%p total_bytes=%zu\n", rank, base, total);
+        printf("COMMON_VA rank=%d pid=%d base=%p total_bytes=%zu reserve_bytes=%zu va_alignment=%zu\n",
+               rank, getpid(), base, total, reserve_bytes, va_alignment);
         drv_mem_prop prop{};
         prop.side = MEM_HOST_NUMA_SIDE; prop.devid = node;
         prop.pg_type = MEM_HUGE_PAGE_TYPE; prop.mem_type = MEM_DDR_TYPE;
@@ -219,6 +235,7 @@ int main(int argc, char** argv) {
             if (key == "--help") {
                 puts("multi_share --devices 1,2,4 --numa-nodes 6,4,0 --size-mib 32 --io-dir DIR\n"
                      "One exec worker per device; equal NUMA Host allocations; identical contiguous VA.\n"
+                     "VA base and reserved length are 1 GiB aligned; physical allocation sizes are unchanged.\n"
                      "CPU, buffered AIO and ACL asynchronous H2D/D2H over the entire shared region.\n"
                      "Initialize with aclInit + aclrtSetDevice; HAL allocates/shares Host memory. No Direct IO.\n"
                      "Unset ASCEND_RT_VISIBLE_DEVICES; IDs refer to the HAL device namespace.\n"
@@ -243,6 +260,8 @@ int main(int argc, char** argv) {
         size_t count = opt.devices.size();
         if (!count || opt.nodes.size() != count || count > 64 || opt.bytes > SIZE_MAX / count)
             throw std::runtime_error("specify 1..64 devices and one NUMA node per device; total size must not overflow");
+        if (opt.bytes * count > SIZE_MAX - (va_alignment - 1))
+            throw std::runtime_error("1 GiB aligned reservation size overflows");
         if (std::set<int>(opt.devices.begin(), opt.devices.end()).size() != count)
             throw std::runtime_error("duplicate device");
         if (getenv("ASCEND_RT_VISIBLE_DEVICES")) throw std::runtime_error("unset ASCEND_RT_VISIBLE_DEVICES to avoid device renumbering");

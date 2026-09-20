@@ -108,7 +108,9 @@ timeout -k 5 180 build/multi_share --devices 1,2,4 --numa-nodes 6,4,0 --size-mib
 
 CPU affinity 绑定到所选 NUMA 节点与当前允许 CPU 集的交集。Host 分配使用 `MEM_HOST_NUMA_SIDE`、`prop.devid=numa_node`、`MEM_HUGE_PAGE_TYPE`、`MEM_DDR_TYPE`，不退回普通 Host 分配。若驱动提供属性查询接口，会核对属性；缺失时明确输出，不据此声称独立验证了物理页位置。
 
-rank 0 预留 `进程数 × 单进程大小` 的 VA 区间并广播基址，其他进程指定同一个地址预留，地址不一致即失败。交换 handle 后，其他进程的内存通过 `halGetHostID` 返回的 Host ID 导入，按 `base + owner_rank × bytes_each` 逐块映射。各进程相同的指针对应相同的共享内容。
+数据长度为 `进程数 × 单进程大小`，VA 预留长度向上取整到 **1 GiB**。rank 0 按该长度自动预留，检查返回基址按 **1 GiB** 对齐后广播；其他进程按同一个基址和对齐后的长度预留，地址不一致即失败。HAL 的 `alignment` 参数是保留参数，仍传 0；不通过修改已预留指针来伪造对齐。
+
+日志 `COMMON_VA` 分别打印 `total_bytes`（实际数据长度）、`reserve_bytes`（对齐后的 VA 长度）和 `va_alignment`。例如三进程各 32 MiB，实际共享数据为 96 MiB，每个进程预留 1 GiB VA；额外 VA 不做物理内存分配或映射。交换 handle 后，其他进程的内存通过 `halGetHostID` 返回的 Host ID 导入，按 `base + owner_rank × bytes_each` 逐块映射。各进程相同的指针对应相同的共享内容。
 
 CPU、AIO、H2D/D2H 都覆盖整个连续区域及映射边界。每个进程轮流写入，所有进程完整校验，避免数据竞争。异步 H2D 完成后清空 Host 区域，再 D2H 回写并完整校验；其他进程随后验证能看到本次 D2H 写入。释放 stream/HBM、全部共享映射、handle 和 VA 后，各进程执行 `aclrtResetDevice(device_id) → aclFinalize()`；不对 SetDevice 创建的默认 context 调用 `aclrtDestroyContext`。
 
@@ -122,7 +124,7 @@ CPU、AIO、H2D/D2H 都覆盖整个连续区域及映射边界。每个进程轮
 | buffered AIO 读写及完整数据校验 | 通过 | 通过 |
 | 各卡 ACL 异步 H2D/D2H，其他进程验证 D2H 结果 | 通过 | 通过 |
 
-本次公共基址均为 `0x12c180000000`；程序动态协商，不硬编码此值。成功时输出 `MULTI_RESULT PASS`，退出码为 0。A5 尚需实机验证。旧 `--copy-api` 诊断选项已移除。
+1 GiB 对齐版本复测上述两组均通过，公共基址均为 `0x12c180000000`，各进程 `reserve_bytes=1073741824`；实际数据长度分别为 6 MiB 和 96 MiB。程序动态协商基址，不硬编码此值。成功时输出 `MULTI_RESULT PASS`，退出码为 0。A5 尚需实机验证。旧 `--copy-api` 诊断选项已移除。
 
 ## 一键运行两种模式
 
