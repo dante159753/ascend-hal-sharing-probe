@@ -80,8 +80,7 @@ static void buffered_aio(void* ptr, size_t bytes, uint64_t seed, const std::stri
 static int worker(const MultiOptions& opt) {
     const size_t count = opt.devices.size(), total = opt.bytes * count;
     const int rank = opt.rank, device = opt.devices[rank], node = opt.nodes[rank];
-    bool acl_init = false;
-    aclrtContext context = nullptr;
+    bool acl_init = false, device_set = false;
     void* base = nullptr;
     std::vector<drv_mem_handle_t*> handles(count, nullptr);
     std::vector<bool> mapped(count, false);
@@ -90,12 +89,16 @@ static int worker(const MultiOptions& opt) {
     try {
         printf("WORKER rank=%d pid=%d device=%d numa=%d bytes_each=%zu\n", rank, getpid(), device, node, opt.bytes);
         bind_cpu(node);
+        printf("INIT rank=%d pid=%d aclInit(config=null) -> aclrtSetDevice(device=%d)\n", rank, getpid(), device);
         check(aclInit(nullptr), "aclInit"); acl_init = true;
-        check(aclrtCreateContext(&context, device), "aclrtCreateContext");
+        check(aclrtSetDevice(device), "aclrtSetDevice"); device_set = true;
         aclrtContext current = nullptr;
         check(aclrtGetCurrentContext(&current), "aclrtGetCurrentContext");
-        if (!context || current != context) throw std::runtime_error("created context is not current");
-        printf("CONTEXT rank=%d device=%d ptr=%p\n", rank, device, context);
+        if (!current) throw std::runtime_error("aclrtSetDevice did not establish a current context");
+        int32_t current_device = -1;
+        check(aclrtGetDevice(&current_device), "aclrtGetDevice");
+        if (current_device != device) throw std::runtime_error("current ACL device differs from requested device");
+        printf("CONTEXT rank=%d pid=%d device=%d ptr=%p init=aclrtSetDevice\n", rank, getpid(), current_device, current);
 
         if (rank == 0) {
             check(halMemAddressReserve(&base, total, 0, nullptr, 0), "reserve coordinator-selected VA");
@@ -194,7 +197,10 @@ static int worker(const MultiOptions& opt) {
         if (handles[i]) cleanup(halMemRelease(handles[i]), "release handle");
     }
     if (base) cleanup(halMemAddressFree(base), "free contiguous VA");
-    if (context) cleanup(aclrtDestroyContext(context), "aclrtDestroyContext");
+    if (device_set) {
+        printf("CLEANUP rank=%d pid=%d aclrtResetDevice(device=%d)\n", rank, getpid(), device);
+        cleanup(aclrtResetDevice(device), "aclrtResetDevice");
+    }
     if (acl_init) cleanup(aclFinalize(), "aclFinalize");
     close(opt.fd);
     result = result || cleanup_failed;
@@ -214,7 +220,7 @@ int main(int argc, char** argv) {
                 puts("multi_share --devices 1,2,4 --numa-nodes 6,4,0 --size-mib 32 --io-dir DIR\n"
                      "One exec worker per device; equal NUMA Host allocations; identical contiguous VA.\n"
                      "CPU, buffered AIO and ACL asynchronous H2D/D2H over the entire shared region.\n"
-                     "Initialize with aclInit + aclrtCreateContext; HAL allocates/shares Host memory. No Direct IO.\n"
+                     "Initialize with aclInit + aclrtSetDevice; HAL allocates/shares Host memory. No Direct IO.\n"
                      "Unset ASCEND_RT_VISIBLE_DEVICES; IDs refer to the HAL device namespace.\n"
                      "Use timeout -k 5 180 externally. Size is per process and must be a positive even MiB value.");
                 return 0;

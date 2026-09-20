@@ -83,14 +83,14 @@ grep ' importer]' device-share.log
 
 ## 多卡 NUMA Host 共享 demo
 
-`multi_share` 为每张指定的卡启动一个独立 exec 工作进程，另有一个仅交换 handle 和同步消息的协调进程。工作进程只使用 **`aclInit → aclrtCreateContext`** 初始化；Runtime 内部负责 TSD、HAL device open 和当前 context。随后仍用 HAL 分配、导出、导入和映射 NUMA Host 内存。不手动调用 `halDeviceOpen`、`aclrtSetDevice` 或 HostRegister。
+`multi_share` 为每张指定的卡启动一个独立 exec 工作进程，另有一个仅交换 handle 和同步消息的协调进程。工作进程使用 **`aclInit(nullptr) → aclrtSetDevice(device_id)`** 初始化；Runtime 内部负责 TSD、HAL device open 和当前 context。程序查询并验证当前 context 非空、当前设备与指定设备一致。随后仍用 HAL 分配、导出、导入和映射 NUMA Host 内存。不手动调用 `halDeviceOpen`、`aclrtCreateContext` 或 HostRegister。
 
 ```bash
 # 首次使用先按上面的“编译”章节配置 CANN 和驱动库路径。
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target multi_share -j
 
-# 按本机拓扑选择空闲卡和对应 NUMA 节点。
+# 按本机拓扑选择测试卡和对应 NUMA 节点。
 npu-smi info -t topo
 lscpu
 mkdir -p "$HOME/hal-probe-io"
@@ -110,9 +110,9 @@ CPU affinity 绑定到所选 NUMA 节点与当前允许 CPU 集的交集。Host 
 
 rank 0 预留 `进程数 × 单进程大小` 的 VA 区间并广播基址，其他进程指定同一个地址预留，地址不一致即失败。交换 handle 后，其他进程的内存通过 `halGetHostID` 返回的 Host ID 导入，按 `base + owner_rank × bytes_each` 逐块映射。各进程相同的指针对应相同的共享内容。
 
-CPU、AIO、H2D/D2H 都覆盖整个连续区域及映射边界。每个进程轮流写入，所有进程完整校验，避免数据竞争。异步 H2D 完成后清空 Host 区域，再 D2H 回写并完整校验；其他进程随后验证能看到本次 D2H 写入。结束时先解除所有进程的映射，再释放 handle、VA 和 context。
+CPU、AIO、H2D/D2H 都覆盖整个连续区域及映射边界。每个进程轮流写入，所有进程完整校验，避免数据竞争。异步 H2D 完成后清空 Host 区域，再 D2H 回写并完整校验；其他进程随后验证能看到本次 D2H 写入。释放 stream/HBM、全部共享映射、handle 和 VA 后，各进程执行 `aclrtResetDevice(device_id) → aclFinalize()`；不对 SetDevice 创建的默认 context 调用 `aclrtDestroyContext`。
 
-2026-09-20 在 A2 910B3、vLLM-Ascend 0.23.0、CANN 9.1.0、驱动 25.5.2 上实测：
+2026-09-20 使用当前 `aclInit + aclrtSetDevice` 版本，在 A2 910B3、vLLM-Ascend 0.23.0、CANN 9.1.0、驱动 25.5.2 上实测（测试时卡 4 已有 vLLM 进程）：
 
 | 用例 | 每进程 2 MiB | 每进程 32 MiB |
 |---|---|---|
@@ -194,7 +194,7 @@ timeout -k 5 120 build/hal_map_probe device 0 2
 
 ## 已知 A2 对照
 
-此前在 A2 910B3、驱动 25.5.2/HAL 7.35.23、vLLM-Ascend 0.23.0/CANN 9.1.0 上：ACL 初始化的 Host 共享 CPU/ACL/buffered AIO 通过；O_DIRECT AIO 返回 EFAULT；旧 ACL 初始化版本的 Device 直接导入返回 8；旧 Host 导入后 SetAccess Device 对照返回 65534。这不是当前固定设备 0 的 HAL 拷贝版本的运行结果。旧 `hal_map_probe` 未调用 `TsdOpen`，其 DeviceOpen 返回 4；补齐 TSD 启动后 DeviceOpen 成功；当前 `multi_share` 通过显式 ACL context 统一完成设备初始化。这些是 A2 对照，不是 A5 预期结果。
+此前在 A2 910B3、驱动 25.5.2/HAL 7.35.23、vLLM-Ascend 0.23.0/CANN 9.1.0 上：ACL 初始化的 Host 共享 CPU/ACL/buffered AIO 通过；O_DIRECT AIO 返回 EFAULT；旧 ACL 初始化版本的 Device 直接导入返回 8；旧 Host 导入后 SetAccess Device 对照返回 65534。这不是当前固定设备 0 的 HAL 拷贝版本的运行结果。旧 `hal_map_probe` 未调用 `TsdOpen`，其 DeviceOpen 返回 4；补齐 TSD 启动后 DeviceOpen 成功；当前 `multi_share` 通过 `aclInit + aclrtSetDevice` 统一完成设备初始化。这些是 A2 对照，不是 A5 预期结果。
 
 ## 参考
 
