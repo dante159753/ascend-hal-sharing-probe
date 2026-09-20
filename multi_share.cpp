@@ -1,0 +1,336 @@
+#include "cli.hpp"
+#include <dlfcn.h>
+#include <sched.h>
+#include <sys/prctl.h>
+#include <signal.h>
+#include <fstream>
+#include <set>
+#include <sstream>
+
+struct MultiOptions {
+    std::vector<int> devices, nodes;
+    size_t bytes = 2 * 1024 * 1024;
+    std::string io_dir = ".";
+    std::string copy_api = "acl-no-set";
+    int rank = -1, fd = -1;
+};
+
+static std::vector<int> list(const std::string& value) {
+    std::vector<int> out;
+    std::istringstream stream(value);
+    std::string part;
+    while (std::getline(stream, part, ',')) {
+        auto n = number(part);
+        if (n > INT_MAX) throw std::runtime_error("list integer out of range");
+        out.push_back(static_cast<int>(n));
+    }
+    if (out.empty() || value.back() == ',') throw std::runtime_error("empty list item");
+    return out;
+}
+
+static void bind_cpu(int node) {
+    std::ifstream file("/sys/devices/system/node/node" + std::to_string(node) + "/cpulist");
+    std::string cpus;
+    if (!(file >> cpus)) throw std::runtime_error("read NUMA node cpulist");
+    cpu_set_t allowed, selected;
+    CPU_ZERO(&selected);
+    check(sched_getaffinity(0, sizeof(allowed), &allowed), "sched_getaffinity");
+    std::istringstream stream(cpus);
+    std::string part;
+    while (std::getline(stream, part, ',')) {
+        auto dash = part.find('-');
+        int first = std::stoi(part.substr(0, dash));
+        int last = dash == std::string::npos ? first : std::stoi(part.substr(dash + 1));
+        if (last >= CPU_SETSIZE) throw std::runtime_error("CPU ID exceeds CPU_SETSIZE");
+        for (int cpu = first; cpu <= last; ++cpu)
+            if (CPU_ISSET(cpu, &allowed)) CPU_SET(cpu, &selected);
+    }
+    if (!CPU_COUNT(&selected)) throw std::runtime_error("NUMA node has no allowed CPUs");
+    check(sched_setaffinity(0, sizeof(selected), &selected), "sched_setaffinity NUMA");
+    printf("CPU_BIND pid=%d numa=%d node_cpus=%s selected_count=%d\n", getpid(), node, cpus.c_str(), CPU_COUNT(&selected));
+}
+
+static void buffered_aio(void* ptr, size_t bytes, uint64_t seed, const std::string& directory) {
+    std::vector<uint64_t> control(bytes / 8);
+    fill(control.data(), bytes, seed);
+    std::string path = directory + "/multi-aio-" + std::to_string(getpid()) + ".bin";
+    int fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd < 0) throw std::runtime_error("open buffered AIO file");
+    if (unlink(path.c_str())) { close(fd); throw std::runtime_error("unlink AIO file"); }
+    aio_context_t ctx = 0;
+    try {
+        check(syscall(SYS_io_setup, 8, &ctx), "io_setup");
+        aio_operation(ctx, fd, control.data(), bytes, true);
+        memset(ptr, 0, bytes);
+        aio_operation(ctx, fd, ptr, bytes, false);
+        verify(ptr, bytes, seed, "AIO_READ_CONTIGUOUS_REGION");
+        check(ftruncate(fd, 0), "truncate before AIO write");
+        aio_operation(ctx, fd, ptr, bytes, true);
+        memset(control.data(), 0, bytes);
+        aio_operation(ctx, fd, control.data(), bytes, false);
+        verify(control.data(), bytes, seed, "AIO_WRITE_CONTIGUOUS_REGION");
+    } catch (...) {
+        if (ctx) cleanup(syscall(SYS_io_destroy, ctx), "io_destroy failed case");
+        cleanup(close(fd), "close failed AIO file");
+        throw;
+    }
+    cleanup(syscall(SYS_io_destroy, ctx), "io_destroy");
+    cleanup(close(fd), "close AIO file");
+}
+
+static int worker(const MultiOptions& opt) {
+    const size_t count = opt.devices.size(), total = opt.bytes * count;
+    const int rank = opt.rank, device = opt.devices[rank], node = opt.nodes[rank];
+    void* tsd = nullptr;
+    using CloseTsd = uint32_t (*)(uint32_t);
+    CloseTsd close_tsd = nullptr;
+    bool tsd_open = false, hal_open = false, acl_init = false;
+    void* base = nullptr;
+    std::vector<drv_mem_handle_t*> handles(count, nullptr);
+    std::vector<bool> mapped(count, false);
+    int result = 0;
+    auto barrier = [&] { send_word(opt.fd, 0); check(receive_word(opt.fd), "barrier"); };
+    try {
+        printf("WORKER rank=%d pid=%d device=%d numa=%d bytes_each=%zu\n", rank, getpid(), device, node, opt.bytes);
+        bind_cpu(node);
+        tsd = dlopen("libtsdclient.so", RTLD_LAZY);
+        if (!tsd) throw std::runtime_error(dlerror());
+        using OpenTsd = uint32_t (*)(uint32_t, uint32_t);
+        auto open_tsd = reinterpret_cast<OpenTsd>(dlsym(tsd, "TsdOpen"));
+        close_tsd = reinterpret_cast<CloseTsd>(dlsym(tsd, "TsdClose"));
+        if (!open_tsd || !close_tsd) throw std::runtime_error("TSD symbols missing");
+        check(open_tsd(device, 0), "TsdOpen"); tsd_open = true;
+        halSetRuntimeApiVer(__HAL_API_VERSION);
+        halDevOpenIn input{}; halDevOpenOut output{};
+        check(halDeviceOpen(device, &input, &output), "halDeviceOpen"); hal_open = true;
+
+        if (rank == 0) {
+            check(halMemAddressReserve(&base, total, 0, nullptr, 0), "reserve coordinator-selected VA");
+            send_word(opt.fd, reinterpret_cast<uint64_t>(base));
+        }
+        auto common_base = receive_word(opt.fd);
+        if (rank != 0)
+            check(halMemAddressReserve(&base, total, 0, reinterpret_cast<void*>(common_base), 0), "reserve identical VA");
+        if (reinterpret_cast<uint64_t>(base) != common_base) throw std::runtime_error("base address differs");
+        printf("COMMON_VA rank=%d base=%p total_bytes=%zu\n", rank, base, total);
+        drv_mem_prop prop{};
+        prop.side = MEM_HOST_NUMA_SIDE; prop.devid = node;
+        prop.pg_type = MEM_HUGE_PAGE_TYPE; prop.mem_type = MEM_DDR_TYPE;
+        check(halMemCreate(&handles[rank], opt.bytes, &prop, 0), "halMemCreate HOST_NUMA");
+        printf("NUMA_ALLOCATION rank=%d requested_node=%d side=%u bytes=%zu\n",
+               rank, node, static_cast<unsigned>(prop.side), opt.bytes);
+        using QueryProperties = drvError_t (*)(drv_mem_prop*, drv_mem_handle_t*);
+        auto query_properties = reinterpret_cast<QueryProperties>(dlsym(RTLD_DEFAULT, "halMemGetAllocationPropertiesFromHandle"));
+        if (query_properties) {
+            drv_mem_prop actual{};
+            check(query_properties(&actual, handles[rank]), "query allocation properties");
+            printf("NUMA_PROPERTIES rank=%d side=%u reported_node=%u\n", rank, static_cast<unsigned>(actual.side), actual.devid);
+            if (actual.side != MEM_HOST_NUMA_SIDE || actual.devid != static_cast<uint32_t>(node))
+                throw std::runtime_error("NUMA allocation properties mismatch");
+        } else puts("NUMA_PROPERTIES query API unavailable; allocation still uses explicit HOST_NUMA, no fallback");
+        uint64_t token;
+        check(halMemExportToShareableHandle(handles[rank], MEM_HANDLE_TYPE_NONE, 0, &token), "export NUMA allocation");
+        ShareHandleAttr attr{}; attr.enableFlag = SHR_HANDLE_NO_WLIST_ENABLE;
+        check(halMemShareHandleSetAttribute(token, SHR_HANDLE_ATTR_NO_WLIST_IN_SERVER, attr), "enable same-server sharing");
+        send_word(opt.fd, token);
+        uint32_t host;
+        check(halGetHostID(&host), "halGetHostID");
+        for (size_t owner = 0; owner < count; ++owner) {
+            token = receive_word(opt.fd);
+            if (owner != static_cast<size_t>(rank))
+                check(halMemImportFromShareableHandle(token, host, &handles[owner]), "import peer as HOST");
+            void* slice = static_cast<char*>(base) + owner * opt.bytes;
+            check(halMemMap(slice, opt.bytes, 0, handles[owner], 0), "map contiguous slice"); mapped[owner] = true;
+            printf("SLICE rank=%d owner=%zu owner_numa=%d va=%p bytes=%zu\n", rank, owner, opt.nodes[owner], slice, opt.bytes);
+        }
+        barrier();
+
+        // One writer at a time; every process verifies every allocation after each write.
+        for (size_t writer = 0; writer < count; ++writer) {
+            uint64_t seed = 100 + writer;
+            if (writer == static_cast<size_t>(rank)) fill(base, total, seed);
+            barrier();
+            verify(base, total, seed, "CPU_ALL_ALLOCATIONS");
+            barrier();
+        }
+        printf("CASE_PASS rank=%d CPU total_bytes=%zu\n", rank, total);
+        for (size_t writer = 0; writer < count; ++writer) {
+            uint64_t seed = 200 + writer;
+            if (writer == static_cast<size_t>(rank)) buffered_aio(base, total, seed, opt.io_dir);
+            barrier();
+            verify(base, total, seed, "PEER_SEES_AIO_WRITE");
+            barrier();
+        }
+        printf("CASE_PASS rank=%d BUFFERED_AIO total_bytes=%zu\n", rank, total);
+
+        if (opt.copy_api == "acl-no-set") {
+            check(aclInit(nullptr), "aclInit for copy diagnostics"); acl_init = true;
+            puts("ACL_NO_SET_DEVICE: retaining manual HAL open; skipping aclrtSetDevice");
+            verify(base, total, 200 + count - 1, "HOST_MAPPING_SURVIVES_ACL_INIT");
+            barrier();
+            Allocation hbm;
+            drv_mem_prop hbm_prop{};
+            hbm_prop.side = MEM_DEV_SIDE; hbm_prop.devid = device;
+            hbm_prop.pg_type = MEM_HUGE_PAGE_TYPE; hbm_prop.mem_type = MEM_HBM_TYPE;
+            check(halMemAddressReserve(&hbm.va, total, 0, nullptr, 0), "reserve HBM for no-set diagnostic");
+            check(halMemCreate(&hbm.handle, total, &hbm_prop, 0), "create HBM for no-set diagnostic");
+            check(halMemMap(hbm.va, total, 0, hbm.handle, 0), "map HBM for no-set diagnostic"); hbm.mapped = true;
+            void* acl_buffer = nullptr;
+            aclrtStream stream = nullptr;
+            auto record = [&](int ret, const char* operation) {
+                printf("ACL_NO_SET rank=%d operation=%s ret=%d\n", rank, operation, ret);
+                if (ret) result = 1;
+                return ret;
+            };
+            record(aclrtMalloc(&acl_buffer, total, ACL_MEM_MALLOC_HUGE_FIRST), "aclrtMalloc");
+            record(aclrtCreateStream(&stream), "aclrtCreateStream");
+            for (size_t writer = 0; writer < count; ++writer) {
+                if (writer == static_cast<size_t>(rank)) {
+                    auto seed = 500 + writer;
+                    fill(base, total, seed);
+                    int h2d = record(aclrtMemcpy(hbm.va, total, base, total, ACL_MEMCPY_HOST_TO_DEVICE), "aclrtMemcpy_H2D_HAL_HBM");
+                    memset(base, 0, total);
+                    int d2h = record(aclrtMemcpy(base, total, hbm.va, total, ACL_MEMCPY_DEVICE_TO_HOST), "aclrtMemcpy_D2H_HAL_HBM");
+                    if (!h2d && !d2h) verify(base, total, seed, "ACL_NO_SET_SYNC_ROUNDTRIP");
+                    fill(base, total, seed + 100);
+                    h2d = record(aclrtMemcpyAsync(hbm.va, total, base, total, ACL_MEMCPY_HOST_TO_DEVICE, stream), "aclrtMemcpyAsync_H2D_HAL_HBM");
+                    if (!h2d) check(aclrtSynchronizeStream(stream), "sync no-set H2D");
+                    memset(base, 0, total);
+                    d2h = record(aclrtMemcpyAsync(base, total, hbm.va, total, ACL_MEMCPY_DEVICE_TO_HOST, stream), "aclrtMemcpyAsync_D2H_HAL_HBM");
+                    if (!d2h) check(aclrtSynchronizeStream(stream), "sync no-set D2H");
+                    if (!h2d && !d2h) verify(base, total, seed + 100, "ACL_NO_SET_ASYNC_ROUNDTRIP");
+                }
+                barrier(); barrier();
+            }
+            if (stream) cleanup(aclrtDestroyStream(stream), "destroy no-set stream");
+            if (acl_buffer) cleanup(aclrtFree(acl_buffer), "free no-set ACL buffer");
+            printf("CASE_RESULT rank=%d ACL_NO_SET %s\n", rank, result ? "FAIL" : "PASS");
+        }
+        barrier();
+        // Unmap everywhere before any owner releases its allocation.
+        for (size_t i = 0; i < count; ++i) {
+            check(halMemUnmap(static_cast<char*>(base) + i * opt.bytes), "unmap slice"); mapped[i] = false;
+        }
+        barrier();
+    } catch (const std::exception& error) {
+        printf("RESULT FAIL rank=%d phase=%s\n", rank, error.what()); result = 1;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (mapped[i]) cleanup(halMemUnmap(static_cast<char*>(base) + i * opt.bytes), "unmap on failure");
+        if (handles[i]) cleanup(halMemRelease(handles[i]), "release handle");
+    }
+    if (base) cleanup(halMemAddressFree(base), "free contiguous VA");
+    if (acl_init) cleanup(aclFinalize(), "aclFinalize");
+    if (hal_open) { halDevCloseIn input{}; cleanup(halDeviceClose(device, &input), "halDeviceClose"); }
+    if (tsd_open) cleanup(close_tsd(device), "TsdClose");
+    if (tsd) cleanup(dlclose(tsd), "dlclose TSD");
+    close(opt.fd);
+    result = result || cleanup_failed;
+    printf("WORKER_RESULT rank=%d ret=%d\n", rank, result);
+    return result;
+}
+
+int main(int argc, char** argv) {
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    MultiOptions opt;
+    std::vector<int> sockets;
+    std::vector<pid_t> children;
+    try {
+        for (int i = 1; i < argc; ++i) {
+            std::string key = argv[i];
+            if (key == "--help") {
+                puts("multi_share --devices 1,2,4 --numa-nodes 6,4,0 --size-mib 32 --io-dir DIR [--copy-api acl-no-set|none]\n"
+                     "One exec worker per device; equal NUMA Host allocations; identical contiguous VA.\n"
+                     "CPU, buffered AIO, ACL calls without SetDevice (default); none skips ACL diagnostics.\n"
+                     "HAL remains open during ACL diagnostics; no Direct IO or HostRegister.\n"
+                     "Unset ASCEND_RT_VISIBLE_DEVICES; IDs refer to the HAL device namespace.\n"
+                     "Use timeout -k 5 180 externally. Size is per process and must be a positive even MiB value.");
+                return 0;
+            }
+            if (++i == argc) throw std::runtime_error("missing option value");
+            std::string value = argv[i];
+            if (key == "--devices") opt.devices = list(value);
+            else if (key == "--numa-nodes") opt.nodes = list(value);
+            else if (key == "--io-dir") opt.io_dir = value;
+            else if (key == "--copy-api") {
+                if (value != "none" && value != "acl-no-set") throw std::runtime_error("invalid copy API");
+                opt.copy_api = value;
+            }
+            else if (key == "--size-mib") {
+                auto mib = number(value);
+                if (!mib || mib % 2 || mib > SIZE_MAX / (1024 * 1024)) throw std::runtime_error("invalid size MiB");
+                opt.bytes = mib * 1024 * 1024;
+            } else if (key == "--rank" || key == "--worker-fd") {
+                auto n = number(value);
+                if (n > INT_MAX) throw std::runtime_error("worker integer out of range");
+                if (key == "--rank") opt.rank = n; else opt.fd = n;
+            } else throw std::runtime_error("unknown option: " + key);
+        }
+        size_t count = opt.devices.size();
+        if (!count || opt.nodes.size() != count || count > 64 || opt.bytes > SIZE_MAX / count)
+            throw std::runtime_error("specify 1..64 devices and one NUMA node per device; total size must not overflow");
+        if (std::set<int>(opt.devices.begin(), opt.devices.end()).size() != count)
+            throw std::runtime_error("duplicate device");
+        if (getenv("ASCEND_RT_VISIBLE_DEVICES")) throw std::runtime_error("unset ASCEND_RT_VISIBLE_DEVICES to avoid device renumbering");
+        if (opt.rank >= 0 || opt.fd >= 0) {
+            if (opt.rank < 0 || static_cast<size_t>(opt.rank) >= count || opt.fd < 0)
+                throw std::runtime_error("invalid worker rank/fd");
+            return worker(opt);
+        }
+        for (size_t rank = 0; rank < count; ++rank) {
+            int pair[2];
+            if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair)) throw std::runtime_error("socketpair");
+            timeval timeout{120, 0};
+            for (int fd : pair) {
+                if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) ||
+                    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout))) {
+                    close(pair[0]); close(pair[1]); throw std::runtime_error("socket timeout");
+                }
+            }
+            std::vector<std::string> args(argv, argv + argc);
+            args.insert(args.end(), {"--rank", std::to_string(rank), "--worker-fd", std::to_string(pair[1])});
+            std::vector<char*> raw;
+            for (auto& arg : args) raw.push_back(arg.data());
+            raw.push_back(nullptr);
+            pid_t parent = getpid(), pid = fork();
+            if (pid < 0) { close(pair[0]); close(pair[1]); throw std::runtime_error("fork"); }
+            if (!pid) {
+                prctl(PR_SET_PDEATHSIG, SIGTERM);
+                if (getppid() != parent) _exit(125);
+                for (int fd : sockets) close(fd);
+                close(pair[0]);
+                execv("/proc/self/exe", raw.data()); _exit(127);
+            }
+            close(pair[1]); sockets.push_back(pair[0]); children.push_back(pid);
+        }
+        auto base = receive_word(sockets[0]);
+        for (int fd : sockets) send_word(fd, base);
+        std::vector<uint64_t> tokens;
+        for (int fd : sockets) tokens.push_back(receive_word(fd));
+        for (int fd : sockets) for (auto token : tokens) send_word(fd, token);
+        size_t barriers = 4 * count + 3;
+        if (opt.copy_api == "acl-no-set") barriers += 2 * count + 1;
+        for (size_t phase = 0; phase < barriers; ++phase) {
+            for (int fd : sockets) check(receive_word(fd), "worker barrier arrived");
+            for (int fd : sockets) send_word(fd, 0);
+        }
+        for (int fd : sockets) close(fd);
+        sockets.clear();
+        int failed = 0;
+        for (auto& child : children) {
+            int status = 0; pid_t ret;
+            do { ret = waitpid(child, &status, 0); } while (ret < 0 && errno == EINTR);
+            if (ret < 0 || !WIFEXITED(status) || WEXITSTATUS(status)) failed = 1;
+            printf("CHILD_RESULT pid=%d status=%d\n", child, status); child = -1;
+        }
+        printf("MULTI_RESULT %s workers=%zu bytes_each=%zu total=%zu base=0x%llx\n",
+               failed ? "FAIL" : "PASS", count, opt.bytes, count * opt.bytes, (unsigned long long)base);
+        return failed;
+    } catch (const std::exception& error) {
+        fprintf(stderr, "MULTI_ERROR %s\n", error.what());
+        for (int fd : sockets) close(fd);
+        for (pid_t child : children) if (child > 0) kill(child, SIGTERM);
+        for (pid_t child : children) if (child > 0) while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {}
+        return children.empty() ? 2 : 1;
+    }
+}
