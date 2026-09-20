@@ -133,21 +133,29 @@ CPU affinity 绑定到所选 NUMA 节点与当前允许 CPU 集的交集。Host 
 
 数据长度为 `进程数 × 单进程大小`，VA 预留长度向上取整到 **1 GiB**。每个进程都通过 `halMemAddressReserve(..., addr=nullptr, ...)` 独立自动选址，检查本地基址按 **1 GiB** 对齐。进程间不交换基址、不要求地址相同，只交换共享 handle 和同步消息。HAL 的 `alignment` 参数是保留参数，仍传 0。
 
-日志 `LOCAL_VA` 分别打印各进程的 `base`、`total_bytes`（实际数据长度）、`reserve_bytes`（对齐后的 VA 长度）和 `va_alignment`。例如三进程各 32 MiB，实际共享数据为 96 MiB，每个进程预留 1 GiB VA；额外 VA 不做物理内存分配或映射。交换 handle 后，其他进程的内存通过 `halGetHostID` 返回的 Host ID 导入，按 `local_base + owner_rank × bytes_each` 逐块映射。每个进程内部仍连续；不同进程通过相同块序号和块内偏移访问同一份共享数据，不能直接交换本地指针。驱动可能恰好返回相同地址，程序不依赖这一点。
+日志 `LOCAL_VA` 分别打印各进程的 `base`、`total_bytes`（实际数据长度）、`reserve_bytes`（对齐后的 VA 长度）和 `va_alignment`。例如三进程各 32 MiB，实际共享数据为 96 MiB，每个进程预留 1 GiB VA；额外 VA 不做物理内存分配或映射。交换 handle 后，自己的 handle 映射为 Host；其他进程的 handle 使用当前 rank 的设备 ID 调用 `halMemImportFromShareableHandle(token, device_id, ...)`，导入为 Device 映射。各块按 `local_base + owner_rank × bytes_each` 排列。每个进程内部仍连续；不同进程通过相同块序号和块内偏移访问同一份共享数据，不能直接交换本地指针。驱动可能恰好返回相同地址，程序不依赖这一点。
 
-CPU、AIO 覆盖整个连续区域。ACL H2D/D2H 每次仅拷贝一个 owner 的分配块，大小为 `--size-mib`；不在一次 copy 中跨越自己的块和其他进程的块。各卡轮流逐块执行 H2D，等待完成后清空该 Host 块，再 D2H 回写并校验；不同块使用不同数据模式，其他进程逐块验证可见性。日志打印 owner、本地/导入来源、源/目的地址及单次拷贝长度。释放 stream/HBM、全部共享映射、handle 和 VA 后，各进程执行 `aclrtResetDevice(device_id) → aclFinalize()`；不对 SetDevice 创建的默认 context 调用 `aclrtDestroyContext`。
+CPU 和 buffered AIO 只访问每个 rank 自己创建的 Host 块，不能直接解引用导入的 Device 地址。每次 ACL copy 只覆盖一个 owner 的分配块：
 
-2026-09-20 使用当前 `aclInit + aclrtSetDevice` 版本，在 A2 910B3、vLLM-Ascend 0.23.0、CANN 9.1.0、驱动 25.5.2 上实测（测试时卡 4 已有 vLLM 进程）：
-
-| 用例 | 每进程 2 MiB | 每进程 32 MiB |
+| 执行进程与 buffer 的关系 | 共享块读入本卡 HBM | 本卡 HBM 写回共享块 |
 |---|---|---|
-| 卡 1/2/4，NUMA 6/4/0，Host 创建/导入/映射 | 通过 | 通过 |
-| 每个进程内部连续映射所有共享块 | 总长 6 MiB | 总长 96 MiB |
-| CPU 读写及跨进程可见性 | 通过 | 通过 |
-| buffered AIO 读写及完整数据校验 | 通过 | 通过 |
-| 各卡 ACL 异步 H2D/D2H，其他进程验证 D2H 结果 | 通过 | 通过 |
+| 当前 rank 是 owner，原始 Host 映射 | H2D | D2H |
+| 当前 rank 是 importer，Device 映射 | D2D | D2D |
 
-独立选址、单块 ACL 拷贝版本在 A2 复测上述两组均通过，均输出 `MULTI_RESULT PASS ... va_mode=independent`，退出码为 0。各进程 `reserve_bytes=1073741824`，实际数据长度分别为 6 MiB 和 96 MiB。本次驱动自动返回的本地基址恰好均为 `0x12c180000000`；所有预留调用都传 `addr=nullptr`，不依赖基址相等，但本次没有覆盖数值不同的基址。A5 尚需实机验证。旧 `--copy-api` 诊断选项已移除。
+各 rank 轮流逐块读写。先读取上一轮内容到 HBM，再 D2H 到普通 Host 校验 buffer；生成新模式并 H2D 到 HBM，随后按上表写回共享块，清空 HBM 后重新读取共享块校验。普通 Host 校验 buffer 与 HBM 间的 H2D/D2H 仅用于生成测试数据和校验；导入映射与 HBM 之间始终是 D2D。每轮完成后，各 owner 用 CPU 检查自己的 Host 块能看到本轮写入。
+
+程序日志统一带 `[pid=... rank=... device=...]`；协调进程使用 `rank=coordinator` 并打印 rank/PID/device/NUMA 对应关系。测试行列出 writer、owner、HOST/DEVICE 视图和传输路径；缩进的调用行列出实际地址、长度、方向和 stream，返回值进一步缩进。
+
+释放 stream/HBM、全部共享映射、handle 和 VA 后，各进程执行 `aclrtResetDevice(device_id) → aclFinalize()`。初始化保持 `aclInit + aclrtSetDevice`，不自动退回 Host 导入。
+
+2026-09-20 在 A2 910B3、vLLM-Ascend 0.23.0、CANN 9.1.0、驱动 25.5.2 上实测当前 Device 导入版本：
+
+| 用例 | 结果 |
+|---|---|
+| 单 rank，设备 1、NUMA 6，2 MiB | CPU、buffered AIO、owner H2D/D2H 通过，退出 0；没有导入块，不代表 D2D 通过 |
+| 三 rank，设备 1/2/4、NUMA 6/4/0，每 rank 2 MiB | 三个 rank 的 Device 导入均返回 `8`，退出 1；尚未执行 D2D |
+
+此前 Host 导入、单块 H2D/D2H 版本的三卡 2/32 MiB 用例通过，是另一条路径的结果。当前版本的 A5 Device 导入和 D2D 能力仍需目标环境验证。成功时输出 `MULTI_RESULT PASS ... va_mode=independent`；`CASE_PASS ACL_ASYNC_BLOCKS` 分别列出 owner H2D/D2H 块数和 importer D2D 块数，单 rank 的 D2D 块数为 0。
 
 ## 一键运行两种模式
 

@@ -48,7 +48,7 @@ static void bind_cpu(int node) {
     }
     if (!CPU_COUNT(&selected)) throw std::runtime_error("NUMA node has no allowed CPUs");
     check(sched_setaffinity(0, sizeof(selected), &selected), "sched_setaffinity NUMA");
-    printf("CPU_BIND pid=%d numa=%d node_cpus=%s selected_count=%d\n", getpid(), node, cpus.c_str(), CPU_COUNT(&selected));
+    log_line(0, "CPU_BIND pid=%d numa=%d node_cpus=%s selected_count=%d", getpid(), node, cpus.c_str(), CPU_COUNT(&selected));
 }
 
 static void buffered_aio(void* ptr, size_t bytes, uint64_t seed, const std::string& directory) {
@@ -64,12 +64,12 @@ static void buffered_aio(void* ptr, size_t bytes, uint64_t seed, const std::stri
         aio_operation(ctx, fd, control.data(), bytes, true);
         memset(ptr, 0, bytes);
         aio_operation(ctx, fd, ptr, bytes, false);
-        verify(ptr, bytes, seed, "AIO_READ_CONTIGUOUS_REGION");
+        verify(ptr, bytes, seed, "AIO_READ_OWN_HOST");
         check(ftruncate(fd, 0), "truncate before AIO write");
         aio_operation(ctx, fd, ptr, bytes, true);
         memset(control.data(), 0, bytes);
         aio_operation(ctx, fd, control.data(), bytes, false);
-        verify(control.data(), bytes, seed, "AIO_WRITE_CONTIGUOUS_REGION");
+        verify(control.data(), bytes, seed, "AIO_WRITE_OWN_HOST");
     } catch (...) {
         if (ctx) cleanup(syscall(SYS_io_destroy, ctx), "io_destroy failed case");
         cleanup(close(fd), "close failed AIO file");
@@ -83,6 +83,9 @@ static int worker(const MultiOptions& opt) {
     const size_t count = opt.devices.size(), total = opt.bytes * count;
     const size_t reserve_bytes = (total + va_alignment - 1) & ~(va_alignment - 1);
     const int rank = opt.rank, device = opt.devices[rank], node = opt.nodes[rank];
+    static std::string role;
+    role = "rank=" + std::to_string(rank) + " device=" + std::to_string(device);
+    log_role = role.c_str();
     bool acl_init = false, device_set = false;
     void* base = nullptr;
     std::vector<drv_mem_handle_t*> handles(count, nullptr);
@@ -90,9 +93,9 @@ static int worker(const MultiOptions& opt) {
     int result = 0;
     auto barrier = [&] { send_word(opt.fd, 0); check(receive_word(opt.fd), "barrier"); };
     try {
-        printf("WORKER rank=%d pid=%d device=%d numa=%d bytes_each=%zu\n", rank, getpid(), device, node, opt.bytes);
+        log_line(0, "WORKER rank=%d pid=%d device=%d numa=%d bytes_each=%zu", rank, getpid(), device, node, opt.bytes);
         bind_cpu(node);
-        printf("INIT rank=%d pid=%d aclInit(config=null) -> aclrtSetDevice(device=%d)\n", rank, getpid(), device);
+        log_line(0, "INIT rank=%d pid=%d aclInit(config=null) -> aclrtSetDevice(device=%d)", rank, getpid(), device);
         check(aclInit(nullptr), "aclInit"); acl_init = true;
         check(aclrtSetDevice(device), "aclrtSetDevice"); device_set = true;
         aclrtContext current = nullptr;
@@ -101,101 +104,116 @@ static int worker(const MultiOptions& opt) {
         int32_t current_device = -1;
         check(aclrtGetDevice(&current_device), "aclrtGetDevice");
         if (current_device != device) throw std::runtime_error("current ACL device differs from requested device");
-        printf("CONTEXT rank=%d pid=%d device=%d ptr=%p init=aclrtSetDevice\n", rank, getpid(), current_device, current);
+        log_line(0, "CONTEXT rank=%d pid=%d device=%d ptr=%p init=aclrtSetDevice", rank, getpid(), current_device, current);
 
-        printf("[pid=%d rank=%d]   CALL halMemAddressReserve(size=%zu, alignment=0, addr=null, flags=0) data_bytes=%zu\n",
-               getpid(), rank, reserve_bytes, total);
+        log_line(1, "CALL halMemAddressReserve(size=%zu, alignment=0, addr=null, flags=0) data_bytes=%zu", reserve_bytes, total);
         check(halMemAddressReserve(&base, reserve_bytes, 0, nullptr, 0), "reserve independent local VA");
-        printf("[pid=%d rank=%d]     OUTPUT base=%p required_alignment=%zu\n", getpid(), rank, base, va_alignment);
+        log_line(2, "OUTPUT base=%p required_alignment=%zu", base, va_alignment);
         if (!base || reinterpret_cast<uintptr_t>(base) % va_alignment)
             throw std::runtime_error("local base is null or not 1 GiB aligned");
-        printf("LOCAL_VA rank=%d pid=%d base=%p total_bytes=%zu reserve_bytes=%zu va_alignment=%zu\n",
+        log_line(0, "LOCAL_VA rank=%d pid=%d base=%p total_bytes=%zu reserve_bytes=%zu va_alignment=%zu",
                rank, getpid(), base, total, reserve_bytes, va_alignment);
         drv_mem_prop prop{};
         prop.side = MEM_HOST_NUMA_SIDE; prop.devid = node;
         prop.pg_type = MEM_HUGE_PAGE_TYPE; prop.mem_type = MEM_DDR_TYPE;
+        log_line(1, "CALL halMemCreate(owner=%d, bytes=%zu, side=MEM_HOST_NUMA_SIDE, numa=%u, pg_type=MEM_HUGE_PAGE_TYPE, mem_type=MEM_DDR_TYPE, flags=0)", rank, opt.bytes, prop.devid);
         check(halMemCreate(&handles[rank], opt.bytes, &prop, 0), "halMemCreate HOST_NUMA");
-        printf("NUMA_ALLOCATION rank=%d requested_node=%d side=%u bytes=%zu\n",
+        log_line(0, "NUMA_ALLOCATION rank=%d requested_node=%d side=%u bytes=%zu",
                rank, node, static_cast<unsigned>(prop.side), opt.bytes);
         using QueryProperties = drvError_t (*)(drv_mem_prop*, drv_mem_handle_t*);
         auto query_properties = reinterpret_cast<QueryProperties>(dlsym(RTLD_DEFAULT, "halMemGetAllocationPropertiesFromHandle"));
         if (query_properties) {
             drv_mem_prop actual{};
             check(query_properties(&actual, handles[rank]), "query allocation properties");
-            printf("NUMA_PROPERTIES rank=%d side=%u reported_node=%u\n", rank, static_cast<unsigned>(actual.side), actual.devid);
+            log_line(0, "NUMA_PROPERTIES rank=%d side=%u reported_node=%u", rank, static_cast<unsigned>(actual.side), actual.devid);
             if (actual.side != MEM_HOST_NUMA_SIDE || actual.devid != static_cast<uint32_t>(node))
                 throw std::runtime_error("NUMA allocation properties mismatch");
-        } else puts("NUMA_PROPERTIES query API unavailable; allocation still uses explicit HOST_NUMA, no fallback");
+        } else log_line(1, "NUMA_PROPERTIES query API unavailable; allocation still uses explicit HOST_NUMA, no fallback");
         uint64_t token;
+        log_line(0, "SHARE export own Host buffer owner=%d", rank);
+        log_line(1, "CALL halMemExportToShareableHandle(handle=%p, type=MEM_HANDLE_TYPE_NONE, flags=0)", static_cast<void*>(handles[rank]));
         check(halMemExportToShareableHandle(handles[rank], MEM_HANDLE_TYPE_NONE, 0, &token), "export NUMA allocation");
         ShareHandleAttr attr{}; attr.enableFlag = SHR_HANDLE_NO_WLIST_ENABLE;
         check(halMemShareHandleSetAttribute(token, SHR_HANDLE_ATTR_NO_WLIST_IN_SERVER, attr), "enable same-server sharing");
+        log_line(2, "OUTPUT token=0x%llx", (unsigned long long)token);
         send_word(opt.fd, token);
-        uint32_t host;
-        check(halGetHostID(&host), "halGetHostID");
         for (size_t owner = 0; owner < count; ++owner) {
             token = receive_word(opt.fd);
-            if (owner != static_cast<size_t>(rank))
-                check(halMemImportFromShareableHandle(token, host, &handles[owner]), "import peer as HOST");
+            if (owner != static_cast<size_t>(rank)) {
+                log_line(0, "IMPORT owner=%zu creator_device=%d target=DEVICE target_device=%d", owner, opt.devices[owner], device);
+                log_line(1, "CALL halMemImportFromShareableHandle(token=0x%llx, devid=%d, out_handle=%p)",
+                         (unsigned long long)token, device, static_cast<void*>(&handles[owner]));
+                check(halMemImportFromShareableHandle(token, device, &handles[owner]), "import peer as DEVICE");
+                log_line(2, "OUTPUT handle=%p", static_cast<void*>(handles[owner]));
+            }
             void* slice = static_cast<char*>(base) + owner * opt.bytes;
+            log_line(1, "CALL halMemMap(owner=%zu, view=%s, va=%p, size=%zu, offset=0, handle=%p, flags=0)",
+                     owner, owner == static_cast<size_t>(rank) ? "HOST" : "DEVICE", slice, opt.bytes, static_cast<void*>(handles[owner]));
             check(halMemMap(slice, opt.bytes, 0, handles[owner], 0), "map contiguous slice"); mapped[owner] = true;
-            printf("SLICE rank=%d owner=%zu owner_numa=%d va=%p bytes=%zu\n", rank, owner, opt.nodes[owner], slice, opt.bytes);
+            log_line(0, "SLICE rank=%d owner=%zu owner_numa=%d va=%p bytes=%zu", rank, owner, opt.nodes[owner], slice, opt.bytes);
         }
         barrier();
 
-        // One writer at a time; every process verifies every allocation after each write.
-        for (size_t writer = 0; writer < count; ++writer) {
-            uint64_t seed = 100 + writer;
-            if (writer == static_cast<size_t>(rank)) fill(base, total, seed);
-            barrier();
-            verify(base, total, seed, "CPU_ALL_ALLOCATIONS");
-            barrier();
-        }
-        printf("CASE_PASS rank=%d CPU total_bytes=%zu\n", rank, total);
-        for (size_t writer = 0; writer < count; ++writer) {
-            uint64_t seed = 200 + writer;
-            if (writer == static_cast<size_t>(rank)) buffered_aio(base, total, seed, opt.io_dir);
-            barrier();
-            verify(base, total, seed, "PEER_SEES_AIO_WRITE");
-            barrier();
-        }
-        printf("CASE_PASS rank=%d BUFFERED_AIO total_bytes=%zu\n", rank, total);
+        void* own_host = static_cast<char*>(base) + rank * opt.bytes;
+        log_line(0, "TEST CPU owner=%d view=HOST bytes=%zu", rank, opt.bytes);
+        fill(own_host, opt.bytes, 100 + rank);
+        verify(own_host, opt.bytes, 100 + rank, "CPU_OWN_HOST");
+        log_line(0, "TEST BUFFERED_AIO owner=%d view=HOST bytes=%zu", rank, opt.bytes);
+        buffered_aio(own_host, opt.bytes, 200 + rank, opt.io_dir);
+        log_line(0, "CASE_PASS CPU_BUFFERED_AIO owner=%d bytes=%zu", rank, opt.bytes);
+        barrier();
 
         {
             AclResources acl;
+            log_line(0, "SETUP HBM and stream copy_bytes=%zu", opt.bytes);
+            log_line(1, "CALL aclrtMalloc(size=%zu, policy=ACL_MEM_MALLOC_HUGE_FIRST)", opt.bytes);
             check(aclrtMalloc(&acl.device, opt.bytes, ACL_MEM_MALLOC_HUGE_FIRST), "allocate one-block local NPU HBM");
             DVattribute attr{};
             check(drvMemGetAttribute(reinterpret_cast<DVdeviceptr>(acl.device), &attr), "query local HBM device");
             if (attr.devId != static_cast<uint32_t>(device)) throw std::runtime_error("ACL/HAL device ID mismatch");
             check(aclrtCreateStream(&acl.stream), "aclrtCreateStream");
+            std::vector<uint64_t> staging(opt.bytes / sizeof(uint64_t));
+            auto copy = [&](void* dst, void* src, aclrtMemcpyKind kind, const char* purpose) {
+                const char* direction = kind == ACL_MEMCPY_HOST_TO_DEVICE ? "H2D" :
+                                        kind == ACL_MEMCPY_DEVICE_TO_HOST ? "D2H" : "D2D";
+                log_line(1, "CALL aclrtMemcpyAsync(dst=%p, dest_max=%zu, src=%p, count=%zu, kind=%s, stream=%p) purpose=%s",
+                         dst, opt.bytes, src, opt.bytes, direction, acl.stream, purpose);
+                check(aclrtMemcpyAsync(dst, opt.bytes, src, opt.bytes, kind, acl.stream), purpose);
+                log_line(1, "CALL aclrtSynchronizeStream(stream=%p)", acl.stream);
+                check(aclrtSynchronizeStream(acl.stream), "sync block copy");
+            };
+            // Serialize writes; only the owner CPU dereferences the original Host mapping.
             for (size_t writer = 0; writer < count; ++writer) {
                 if (writer == static_cast<size_t>(rank)) {
                     for (size_t owner = 0; owner < count; ++owner) {
                         void* slice = static_cast<char*>(base) + owner * opt.bytes;
                         uint64_t seed = 300 + writer * count + owner;
-                        printf("[pid=%d rank=%d] TEST ACL_ASYNC_BLOCK owner=%zu source=%s bytes=%zu\n",
-                               getpid(), rank, owner, owner == static_cast<size_t>(rank) ? "local" : "imported", opt.bytes);
-                        fill(slice, opt.bytes, seed);
-                        printf("[pid=%d rank=%d]   aclrtMemcpyAsync(dst=%p, dest_max=%zu, src=%p, count=%zu, kind=H2D, stream=%p)\n",
-                               getpid(), rank, acl.device, opt.bytes, slice, opt.bytes, acl.stream);
-                        check(aclrtMemcpyAsync(acl.device, opt.bytes, slice, opt.bytes, ACL_MEMCPY_HOST_TO_DEVICE, acl.stream), "ACL async H2D single block");
-                        check(aclrtSynchronizeStream(acl.stream), "sync H2D");
-                        memset(slice, 0, opt.bytes);
-                        printf("[pid=%d rank=%d]   aclrtMemcpyAsync(dst=%p, dest_max=%zu, src=%p, count=%zu, kind=D2H, stream=%p)\n",
-                               getpid(), rank, slice, opt.bytes, acl.device, opt.bytes, acl.stream);
-                        check(aclrtMemcpyAsync(slice, opt.bytes, acl.device, opt.bytes, ACL_MEMCPY_DEVICE_TO_HOST, acl.stream), "ACL async D2H single block");
-                        check(aclrtSynchronizeStream(acl.stream), "sync D2H");
-                        verify(slice, opt.bytes, seed, "ACL_ASYNC_ROUNDTRIP_SINGLE_BLOCK");
+                        const bool local = owner == static_cast<size_t>(rank);
+                        const auto read_kind = local ? ACL_MEMCPY_HOST_TO_DEVICE : ACL_MEMCPY_DEVICE_TO_DEVICE;
+                        const auto write_kind = local ? ACL_MEMCPY_DEVICE_TO_HOST : ACL_MEMCPY_DEVICE_TO_DEVICE;
+                        log_line(0, "TEST ACL_ASYNC_BLOCK writer=%zu owner=%zu view=%s path=%s bytes=%zu",
+                                 writer, owner, local ? "HOST" : "DEVICE", local ? "H2D/D2H" : "D2D", opt.bytes);
+                        copy(acl.device, slice, read_kind, "read shared block into HBM");
+                        copy(staging.data(), acl.device, ACL_MEMCPY_DEVICE_TO_HOST, "HBM readback for CPU verification");
+                        uint64_t previous_seed = writer == 0 ? 200 + owner : 300 + (writer - 1) * count + owner;
+                        verify(staging.data(), opt.bytes, previous_seed, "SHARED_BLOCK_BEFORE_WRITE");
+                        fill(staging.data(), opt.bytes, seed);
+                        copy(acl.device, staging.data(), ACL_MEMCPY_HOST_TO_DEVICE, "stage new pattern in HBM");
+                        copy(slice, acl.device, write_kind, "write HBM into shared block");
+                        log_line(1, "CALL aclrtMemset(ptr=%p, max_count=%zu, value=0, count=%zu)", acl.device, opt.bytes, opt.bytes);
+                        check(aclrtMemset(acl.device, opt.bytes, 0, opt.bytes), "clear HBM before shared readback");
+                        copy(acl.device, slice, read_kind, "read shared block back into HBM");
+                        memset(staging.data(), 0, opt.bytes);
+                        copy(staging.data(), acl.device, ACL_MEMCPY_DEVICE_TO_HOST, "HBM readback after shared write");
+                        verify(staging.data(), opt.bytes, seed, "ACL_ASYNC_ROUNDTRIP_SINGLE_BLOCK");
                     }
                 }
                 barrier();
-                for (size_t owner = 0; owner < count; ++owner) {
-                    void* slice = static_cast<char*>(base) + owner * opt.bytes;
-                    verify(slice, opt.bytes, 300 + writer * count + owner, "PEER_SEES_D2H_BLOCK_WRITE");
-                }
+                log_line(0, "VERIFY_OWNER writer=%zu owner=%d view=HOST", writer, rank);
+                verify(own_host, opt.bytes, 300 + writer * count + rank, "OWNER_SEES_SHARED_WRITE");
                 barrier();
             }
-            printf("CASE_PASS rank=%d ACL_ASYNC_H2D_D2H copy_bytes=%zu blocks=%zu\n", rank, opt.bytes, count);
+            log_line(0, "CASE_PASS ACL_ASYNC_BLOCKS owner_h2d_d2h_blocks=1 imported_d2d_blocks=%zu copy_bytes=%zu", count - 1, opt.bytes);
         }
         barrier();
         // Unmap everywhere before any owner releases its allocation.
@@ -204,7 +222,7 @@ static int worker(const MultiOptions& opt) {
         }
         barrier();
     } catch (const std::exception& error) {
-        printf("RESULT FAIL rank=%d phase=%s\n", rank, error.what()); result = 1;
+        log_line(0, "RESULT FAIL rank=%d phase=%s", rank, error.what()); result = 1;
     }
     for (size_t i = 0; i < count; ++i) {
         if (mapped[i]) cleanup(halMemUnmap(static_cast<char*>(base) + i * opt.bytes), "unmap on failure");
@@ -212,17 +230,18 @@ static int worker(const MultiOptions& opt) {
     }
     if (base) cleanup(halMemAddressFree(base), "free contiguous VA");
     if (device_set) {
-        printf("CLEANUP rank=%d pid=%d aclrtResetDevice(device=%d)\n", rank, getpid(), device);
+        log_line(0, "CLEANUP rank=%d pid=%d aclrtResetDevice(device=%d)", rank, getpid(), device);
         cleanup(aclrtResetDevice(device), "aclrtResetDevice");
     }
     if (acl_init) cleanup(aclFinalize(), "aclFinalize");
     close(opt.fd);
     result = result || cleanup_failed;
-    printf("WORKER_RESULT rank=%d ret=%d\n", rank, result);
+    log_line(0, "WORKER_RESULT rank=%d ret=%d", rank, result);
     return result;
 }
 
 int main(int argc, char** argv) {
+    log_role = "rank=coordinator";
     setvbuf(stdout, nullptr, _IONBF, 0);
     MultiOptions opt;
     std::vector<int> sockets;
@@ -235,7 +254,7 @@ int main(int argc, char** argv) {
                      "One exec worker per device; equal NUMA Host allocations; independent local contiguous VA.\n"
                      "Each worker reserves with addr=null; virtual addresses need not match across processes.\n"
                      "VA base and reserved length are 1 GiB aligned; physical allocation sizes are unchanged.\n"
-                     "CPU/buffered AIO over the shared region; ACL async H2D/D2H copies one allocation per call.\n"
+                     "Own Host mapping: CPU/buffered AIO and H2D/D2H. Imported Device mapping: D2D to/from local HBM.\n"
                      "Initialize with aclInit + aclrtSetDevice; HAL allocates/shares Host memory. No Direct IO.\n"
                      "Unset ASCEND_RT_VISIBLE_DEVICES; IDs refer to the HAL device namespace.\n"
                      "Use timeout -k 5 180 externally. Size is per process and must be a positive even MiB value.");
@@ -294,11 +313,15 @@ int main(int argc, char** argv) {
                 execv("/proc/self/exe", raw.data()); _exit(127);
             }
             close(pair[1]); sockets.push_back(pair[0]); children.push_back(pid);
+            log_line(0, "WORKER_STARTED rank=%zu pid=%d device=%d numa=%d", rank, pid, opt.devices[rank], opt.nodes[rank]);
         }
         std::vector<uint64_t> tokens;
-        for (int fd : sockets) tokens.push_back(receive_word(fd));
+        for (size_t rank = 0; rank < sockets.size(); ++rank) {
+            log_line(0, "WAIT_EXPORT rank=%zu child_pid=%d", rank, children[rank]);
+            tokens.push_back(receive_word(sockets[rank]));
+        }
         for (int fd : sockets) for (auto token : tokens) send_word(fd, token);
-        const size_t barriers = 6 * count + 3;
+        const size_t barriers = 2 * count + 4;
         for (size_t phase = 0; phase < barriers; ++phase) {
             for (int fd : sockets) check(receive_word(fd), "worker barrier arrived");
             for (int fd : sockets) send_word(fd, 0);
@@ -310,13 +333,13 @@ int main(int argc, char** argv) {
             int status = 0; pid_t ret;
             do { ret = waitpid(child, &status, 0); } while (ret < 0 && errno == EINTR);
             if (ret < 0 || !WIFEXITED(status) || WEXITSTATUS(status)) failed = 1;
-            printf("CHILD_RESULT pid=%d status=%d\n", child, status); child = -1;
+            log_line(0, "CHILD_RESULT pid=%d status=%d", child, status); child = -1;
         }
-        printf("MULTI_RESULT %s workers=%zu bytes_each=%zu total=%zu va_mode=independent\n",
+        log_line(0, "MULTI_RESULT %s workers=%zu bytes_each=%zu total=%zu va_mode=independent",
                failed ? "FAIL" : "PASS", count, opt.bytes, count * opt.bytes);
         return failed;
     } catch (const std::exception& error) {
-        fprintf(stderr, "MULTI_ERROR %s\n", error.what());
+        log_line(0, "MULTI_ERROR %s", error.what());
         for (int fd : sockets) close(fd);
         for (pid_t child : children) if (child > 0) kill(child, SIGTERM);
         for (pid_t child : children) if (child > 0) while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {}

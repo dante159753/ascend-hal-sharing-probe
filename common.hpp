@@ -119,7 +119,8 @@ inline void aio_operation(aio_context_t& ctx, int fd, void* ptr, size_t bytes, b
     }
     errno=0;
     long submitted = syscall(SYS_io_submit, ctx, n, requests);
-    std::printf("AIO %s submitted=%ld expected=%d errno=%d\n", write?"write":"read", submitted,n,submitted<0?errno:0);
+    if (log_role) log_line(1, "AIO %s ptr=%p bytes=%zu submitted=%ld expected=%d errno=%d", write?"write":"read", ptr, bytes, submitted,n,submitted<0?errno:0);
+    else std::printf("AIO %s submitted=%ld expected=%d errno=%d\n", write?"write":"read", submitted,n,submitted<0?errno:0);
     if (submitted != n) {
         // Quiesce any accepted requests before the caller reuses its buffer.
         cleanup(syscall(SYS_io_destroy, ctx), "io_destroy incomplete submit"); ctx = 0;
@@ -128,7 +129,8 @@ inline void aio_operation(aio_context_t& ctx, int fd, void* ptr, size_t bytes, b
     io_event events[n]{};
     timespec timeout{10,0};
     long completed = syscall(SYS_io_getevents,ctx,n,n,events,&timeout);
-    std::printf("AIO %s completed=%ld\n", write?"write":"read",completed);
+    if (log_role) log_line(2, "AIO %s completed=%ld", write?"write":"read",completed);
+    else std::printf("AIO %s completed=%ld\n", write?"write":"read",completed);
     if (completed != n) {
         cleanup(syscall(SYS_io_destroy, ctx), "io_destroy incomplete completion"); ctx = 0;
         throw std::runtime_error("io_getevents");
@@ -136,9 +138,14 @@ inline void aio_operation(aio_context_t& ctx, int fd, void* ptr, size_t bytes, b
     unsigned seen=0;
     bool failed=false;
     for (int i=0;i<n;++i) {
-        std::printf("AIO event index=%llu res=%lld res2=%lld\n",
+        if (log_role) log_line(2, "AIO event index=%llu res=%lld res2=%lld",
                     (unsigned long long)events[i].data,(long long)events[i].res,(long long)events[i].res2);
-        if (events[i].res < 0) std::printf("AIO error=%s\n", strerror(-events[i].res));
+        else std::printf("AIO event index=%llu res=%lld res2=%lld\n",
+                    (unsigned long long)events[i].data,(long long)events[i].res,(long long)events[i].res2);
+        if (events[i].res < 0) {
+            if (log_role) log_line(2, "AIO error=%s", strerror(-events[i].res));
+            else std::printf("AIO error=%s\n", strerror(-events[i].res));
+        }
         if(events[i].data>=n || (seen&(1U<<events[i].data)) || events[i].res!=(long long)chunk || events[i].res2)
             failed=true;
         if(events[i].data<n) seen |= 1U<<events[i].data;
