@@ -8,6 +8,7 @@
 #include <sstream>
 
 static constexpr size_t va_alignment = size_t{1} << 30;
+static constexpr size_t read_rounds = 2;
 
 struct MultiOptions {
     std::vector<int> devices, nodes;
@@ -182,38 +183,33 @@ static int worker(const MultiOptions& opt) {
                 log_line(1, "CALL aclrtSynchronizeStream(stream=%p)", acl.stream);
                 check(aclrtSynchronizeStream(acl.stream), "sync block copy");
             };
-            // Serialize writes; only the owner CPU dereferences the original Host mapping.
-            for (size_t writer = 0; writer < count; ++writer) {
-                if (writer == static_cast<size_t>(rank)) {
-                    for (size_t owner = 0; owner < count; ++owner) {
-                        void* slice = static_cast<char*>(base) + owner * opt.bytes;
-                        uint64_t seed = 300 + writer * count + owner;
-                        const bool local = owner == static_cast<size_t>(rank);
-                        const auto read_kind = local ? ACL_MEMCPY_HOST_TO_DEVICE : ACL_MEMCPY_DEVICE_TO_DEVICE;
-                        const auto write_kind = local ? ACL_MEMCPY_DEVICE_TO_HOST : ACL_MEMCPY_DEVICE_TO_DEVICE;
-                        log_line(0, "TEST ACL_ASYNC_BLOCK writer=%zu owner=%zu view=%s path=%s bytes=%zu",
-                                 writer, owner, local ? "HOST" : "DEVICE", local ? "H2D/D2H" : "D2D", opt.bytes);
-                        copy(acl.device, slice, read_kind, "read shared block into HBM");
-                        copy(staging.data(), acl.device, ACL_MEMCPY_DEVICE_TO_HOST, "HBM readback for CPU verification");
-                        uint64_t previous_seed = writer == 0 ? 200 + owner : 300 + (writer - 1) * count + owner;
-                        verify(staging.data(), opt.bytes, previous_seed, "SHARED_BLOCK_BEFORE_WRITE");
-                        fill(staging.data(), opt.bytes, seed);
-                        copy(acl.device, staging.data(), ACL_MEMCPY_HOST_TO_DEVICE, "stage new pattern in HBM");
-                        copy(slice, acl.device, write_kind, "write HBM into shared block");
-                        log_line(1, "CALL aclrtMemset(ptr=%p, max_count=%zu, value=0, count=%zu)", acl.device, opt.bytes, opt.bytes);
-                        check(aclrtMemset(acl.device, opt.bytes, 0, opt.bytes), "clear HBM before shared readback");
-                        copy(acl.device, slice, read_kind, "read shared block back into HBM");
-                        memset(staging.data(), 0, opt.bytes);
-                        copy(staging.data(), acl.device, ACL_MEMCPY_DEVICE_TO_HOST, "HBM readback after shared write");
-                        verify(staging.data(), opt.bytes, seed, "ACL_ASYNC_ROUNDTRIP_SINGLE_BLOCK");
-                    }
-                }
+            for (size_t round = 0; round < read_rounds; ++round) {
+                const uint64_t own_seed = 300 + round * count + rank;
+                log_line(0, "TEST OWNER_CPU_WRITE round=%zu owner=%d ptr=%p bytes=%zu seed=%llu",
+                         round, rank, own_host, opt.bytes, (unsigned long long)own_seed);
+                fill(own_host, opt.bytes, own_seed);
+                verify(own_host, opt.bytes, own_seed, "OWNER_CPU_DATA");
+                // All owners finish writing before any reader starts; no next-round writes until all readers finish.
                 barrier();
-                log_line(0, "VERIFY_OWNER writer=%zu owner=%d view=HOST", writer, rank);
-                verify(own_host, opt.bytes, 300 + writer * count + rank, "OWNER_SEES_SHARED_WRITE");
+                for (size_t owner = 0; owner < count; ++owner) {
+                    void* slice = static_cast<char*>(base) + owner * opt.bytes;
+                    const uint64_t seed = 300 + round * count + owner;
+                    const bool local = owner == static_cast<size_t>(rank);
+                    const auto kind = local ? ACL_MEMCPY_HOST_TO_DEVICE : ACL_MEMCPY_DEVICE_TO_DEVICE;
+                    log_line(0, "TEST READ_ONLY_BLOCK round=%zu reader=%d owner=%zu view=%s path=%s src=%p bytes=%zu seed=%llu",
+                             round, rank, owner, local ? "HOST" : "DEVICE", local ? "H2D" : "D2D", slice, opt.bytes, (unsigned long long)seed);
+                    log_line(1, "CALL aclrtMemset(ptr=%p, max_count=%zu, value=0, count=%zu)", acl.device, opt.bytes, opt.bytes);
+                    check(aclrtMemset(acl.device, opt.bytes, 0, opt.bytes), "clear HBM before shared read");
+                    copy(acl.device, slice, kind, "read owner-written shared block into HBM");
+                    memset(staging.data(), 0, opt.bytes);
+                    copy(staging.data(), acl.device, ACL_MEMCPY_DEVICE_TO_HOST, "HBM readback for CPU verification");
+                    const std::string phase = "OWNER_WRITE_READER_VERIFY round=" + std::to_string(round) + " owner=" + std::to_string(owner);
+                    verify(staging.data(), opt.bytes, seed, phase.c_str());
+                }
+                verify(own_host, opt.bytes, own_seed, "OWNER_DATA_UNCHANGED_AFTER_READS");
                 barrier();
             }
-            log_line(0, "CASE_PASS ACL_ASYNC_BLOCKS owner_h2d_d2h_blocks=1 imported_d2d_blocks=%zu copy_bytes=%zu", count - 1, opt.bytes);
+            log_line(0, "CASE_PASS OWNER_WRITE_READ_ONLY rounds=%zu own_h2d_blocks=1 imported_d2d_blocks=%zu copy_bytes=%zu", read_rounds, count - 1, opt.bytes);
         }
         barrier();
         // Unmap everywhere before any owner releases its allocation.
@@ -254,7 +250,8 @@ int main(int argc, char** argv) {
                      "One exec worker per device; equal NUMA Host allocations; independent local contiguous VA.\n"
                      "Each worker reserves with addr=null; virtual addresses need not match across processes.\n"
                      "VA base and reserved length are 1 GiB aligned; physical allocation sizes are unchanged.\n"
-                     "Own Host mapping: CPU/buffered AIO and H2D/D2H. Imported Device mapping: D2D to/from local HBM.\n"
+                     "Only owners write shared Host buffers. Two rounds: own H2D / imported Device D2D reads into HBM.\n"
+                     "D2H targets a private verification buffer; no device copy writes into any shared mapping.\n"
                      "Initialize with aclInit + aclrtSetDevice; HAL allocates/shares Host memory. No Direct IO.\n"
                      "Unset ASCEND_RT_VISIBLE_DEVICES; IDs refer to the HAL device namespace.\n"
                      "Use timeout -k 5 180 externally. Size is per process and must be a positive even MiB value.");
@@ -321,7 +318,7 @@ int main(int argc, char** argv) {
             tokens.push_back(receive_word(sockets[rank]));
         }
         for (int fd : sockets) for (auto token : tokens) send_word(fd, token);
-        const size_t barriers = 2 * count + 4;
+        const size_t barriers = 2 * read_rounds + 4;
         for (size_t phase = 0; phase < barriers; ++phase) {
             for (int fd : sockets) check(receive_word(fd), "worker barrier arrived");
             for (int fd : sockets) send_word(fd, 0);

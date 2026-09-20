@@ -137,14 +137,14 @@ CPU affinity 绑定到所选 NUMA 节点与当前允许 CPU 集的交集。Host 
 
 CPU 和 buffered AIO 只访问每个 rank 自己创建的 Host 块，不能直接解引用导入的 Device 地址。每次 ACL copy 只覆盖一个 owner 的分配块：
 
-| 执行进程与 buffer 的关系 | 共享块读入本卡 HBM | 本卡 HBM 写回共享块 |
+| 执行进程与 buffer 的关系 | 共享块的数据来源 | 共享块读入本卡 HBM |
 |---|---|---|
-| 当前 rank 是 owner，原始 Host 映射 | H2D | D2H |
-| 当前 rank 是 importer，Device 映射 | D2D | D2D |
+| 当前 rank 是 owner，原始 Host 映射 | owner CPU 写入 | H2D |
+| 当前 rank 是 importer，Device 映射 | 只读取 owner 写入的数据 | D2D |
 
-各 rank 轮流逐块读写。先读取上一轮内容到 HBM，再 D2H 到普通 Host 校验 buffer；生成新模式并 H2D 到 HBM，随后按上表写回共享块，清空 HBM 后重新读取共享块校验。普通 Host 校验 buffer 与 HBM 间的 H2D/D2H 仅用于生成测试数据和校验；导入映射与 HBM 之间始终是 D2D。每轮完成后，各 owner 用 CPU 检查自己的 Host 块能看到本轮写入。
+共享传输测试执行两轮，每轮所有 owner 用 CPU 写各自的 Host 块，数据 seed 为 `300 + round × rank数量 + owner`。通过 barrier 确保写入完成后，各 rank 逐块读取自己的 Host 映射（H2D）或其他 owner 的 Device 映射（D2D）到本卡 HBM，再 D2H 到私有普通 Host buffer 全量校验。每块读取前清空 HBM 和私有校验 buffer。共享映射从不作为 device copy 的目的地址，导入者不写回；D2H 只写私有校验 buffer。全部读者完成后才进入下一轮，避免读取与 owner 更新数据并发。
 
-程序日志统一带 `[pid=... rank=... device=...]`；协调进程使用 `rank=coordinator` 并打印 rank/PID/device/NUMA 对应关系。测试行列出 writer、owner、HOST/DEVICE 视图和传输路径；缩进的调用行列出实际地址、长度、方向和 stream，返回值进一步缩进。
+程序日志统一带 `[pid=... rank=... device=...]`；协调进程使用 `rank=coordinator` 并打印 rank/PID/device/NUMA 对应关系。`OWNER_CPU_WRITE` 列出写入者和 seed；`READ_ONLY_BLOCK` 列出 round、reader、owner、HOST/DEVICE 视图及传输路径；缩进的调用行列出实际地址、长度、方向和 stream。校验阶段名也包含 round 和 owner，因此 `MISMATCH` 与 `RESULT FAIL` 可直接定位到具体数据块。
 
 释放 stream/HBM、全部共享映射、handle 和 VA 后，各进程执行 `aclrtResetDevice(device_id) → aclFinalize()`。初始化保持 `aclInit + aclrtSetDevice`，不自动退回 Host 导入。
 
@@ -152,10 +152,10 @@ CPU 和 buffered AIO 只访问每个 rank 自己创建的 Host 块，不能直�
 
 | 用例 | 结果 |
 |---|---|
-| 单 rank，设备 1、NUMA 6，2 MiB | CPU、buffered AIO、owner H2D/D2H 通过，退出 0；没有导入块，不代表 D2D 通过 |
+| 单 rank，设备 1、NUMA 6，2 MiB | CPU、buffered AIO、两轮 owner CPU 写入 → H2D → 私有 buffer D2H 校验通过，退出 0；没有导入块，不代表 D2D 通过 |
 | 三 rank，设备 1/2/4、NUMA 6/4/0，每 rank 2 MiB | 三个 rank 的 Device 导入均返回 `8`，退出 1；尚未执行 D2D |
 
-此前 Host 导入、单块 H2D/D2H 版本的三卡 2/32 MiB 用例通过，是另一条路径的结果。当前版本的 A5 Device 导入和 D2D 能力仍需目标环境验证。成功时输出 `MULTI_RESULT PASS ... va_mode=independent`；`CASE_PASS ACL_ASYNC_BLOCKS` 分别列出 owner H2D/D2H 块数和 importer D2D 块数，单 rank 的 D2D 块数为 0。
+此前 Host 导入、单块 H2D/D2H 版本的三卡 2/32 MiB 用例通过，是另一条路径的结果。当前 owner 写、importer 只读版本的 A5 数据可见性仍需目标环境验证。成功时输出 `MULTI_RESULT PASS ... va_mode=independent`；`CASE_PASS OWNER_WRITE_READ_ONLY` 列出轮数、owner H2D 块数和 importer D2D 块数，单 rank 的 D2D 块数为 0。
 
 ## 一键运行两种模式
 
