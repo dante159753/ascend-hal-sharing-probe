@@ -11,7 +11,6 @@ struct MultiOptions {
     std::vector<int> devices, nodes;
     size_t bytes = 2 * 1024 * 1024;
     std::string io_dir = ".";
-    std::string copy_api = "acl-no-set";
     int rank = -1, fd = -1;
 };
 
@@ -81,10 +80,8 @@ static void buffered_aio(void* ptr, size_t bytes, uint64_t seed, const std::stri
 static int worker(const MultiOptions& opt) {
     const size_t count = opt.devices.size(), total = opt.bytes * count;
     const int rank = opt.rank, device = opt.devices[rank], node = opt.nodes[rank];
-    void* tsd = nullptr;
-    using CloseTsd = uint32_t (*)(uint32_t);
-    CloseTsd close_tsd = nullptr;
-    bool tsd_open = false, hal_open = false, acl_init = false;
+    bool acl_init = false;
+    aclrtContext context = nullptr;
     void* base = nullptr;
     std::vector<drv_mem_handle_t*> handles(count, nullptr);
     std::vector<bool> mapped(count, false);
@@ -93,16 +90,12 @@ static int worker(const MultiOptions& opt) {
     try {
         printf("WORKER rank=%d pid=%d device=%d numa=%d bytes_each=%zu\n", rank, getpid(), device, node, opt.bytes);
         bind_cpu(node);
-        tsd = dlopen("libtsdclient.so", RTLD_LAZY);
-        if (!tsd) throw std::runtime_error(dlerror());
-        using OpenTsd = uint32_t (*)(uint32_t, uint32_t);
-        auto open_tsd = reinterpret_cast<OpenTsd>(dlsym(tsd, "TsdOpen"));
-        close_tsd = reinterpret_cast<CloseTsd>(dlsym(tsd, "TsdClose"));
-        if (!open_tsd || !close_tsd) throw std::runtime_error("TSD symbols missing");
-        check(open_tsd(device, 0), "TsdOpen"); tsd_open = true;
-        halSetRuntimeApiVer(__HAL_API_VERSION);
-        halDevOpenIn input{}; halDevOpenOut output{};
-        check(halDeviceOpen(device, &input, &output), "halDeviceOpen"); hal_open = true;
+        check(aclInit(nullptr), "aclInit"); acl_init = true;
+        check(aclrtCreateContext(&context, device), "aclrtCreateContext");
+        aclrtContext current = nullptr;
+        check(aclrtGetCurrentContext(&current), "aclrtGetCurrentContext");
+        if (!context || current != context) throw std::runtime_error("created context is not current");
+        printf("CONTEXT rank=%d device=%d ptr=%p\n", rank, device, context);
 
         if (rank == 0) {
             check(halMemAddressReserve(&base, total, 0, nullptr, 0), "reserve coordinator-selected VA");
@@ -163,48 +156,29 @@ static int worker(const MultiOptions& opt) {
         }
         printf("CASE_PASS rank=%d BUFFERED_AIO total_bytes=%zu\n", rank, total);
 
-        if (opt.copy_api == "acl-no-set") {
-            check(aclInit(nullptr), "aclInit for copy diagnostics"); acl_init = true;
-            puts("ACL_NO_SET_DEVICE: retaining manual HAL open; skipping aclrtSetDevice");
-            verify(base, total, 200 + count - 1, "HOST_MAPPING_SURVIVES_ACL_INIT");
-            barrier();
-            Allocation hbm;
-            drv_mem_prop hbm_prop{};
-            hbm_prop.side = MEM_DEV_SIDE; hbm_prop.devid = device;
-            hbm_prop.pg_type = MEM_HUGE_PAGE_TYPE; hbm_prop.mem_type = MEM_HBM_TYPE;
-            check(halMemAddressReserve(&hbm.va, total, 0, nullptr, 0), "reserve HBM for no-set diagnostic");
-            check(halMemCreate(&hbm.handle, total, &hbm_prop, 0), "create HBM for no-set diagnostic");
-            check(halMemMap(hbm.va, total, 0, hbm.handle, 0), "map HBM for no-set diagnostic"); hbm.mapped = true;
-            void* acl_buffer = nullptr;
-            aclrtStream stream = nullptr;
-            auto record = [&](int ret, const char* operation) {
-                printf("ACL_NO_SET rank=%d operation=%s ret=%d\n", rank, operation, ret);
-                if (ret) result = 1;
-                return ret;
-            };
-            record(aclrtMalloc(&acl_buffer, total, ACL_MEM_MALLOC_HUGE_FIRST), "aclrtMalloc");
-            record(aclrtCreateStream(&stream), "aclrtCreateStream");
+        {
+            AclResources acl;
+            check(aclrtMalloc(&acl.device, total, ACL_MEM_MALLOC_HUGE_FIRST), "allocate local NPU HBM");
+            DVattribute attr{};
+            check(drvMemGetAttribute(reinterpret_cast<DVdeviceptr>(acl.device), &attr), "query local HBM device");
+            if (attr.devId != static_cast<uint32_t>(device)) throw std::runtime_error("ACL/HAL device ID mismatch");
+            check(aclrtCreateStream(&acl.stream), "aclrtCreateStream");
             for (size_t writer = 0; writer < count; ++writer) {
+                uint64_t seed = 300 + writer;
                 if (writer == static_cast<size_t>(rank)) {
-                    auto seed = 500 + writer;
                     fill(base, total, seed);
-                    int h2d = record(aclrtMemcpy(hbm.va, total, base, total, ACL_MEMCPY_HOST_TO_DEVICE), "aclrtMemcpy_H2D_HAL_HBM");
+                    check(aclrtMemcpyAsync(acl.device, total, base, total, ACL_MEMCPY_HOST_TO_DEVICE, acl.stream), "ACL async H2D full region");
+                    check(aclrtSynchronizeStream(acl.stream), "sync H2D");
                     memset(base, 0, total);
-                    int d2h = record(aclrtMemcpy(base, total, hbm.va, total, ACL_MEMCPY_DEVICE_TO_HOST), "aclrtMemcpy_D2H_HAL_HBM");
-                    if (!h2d && !d2h) verify(base, total, seed, "ACL_NO_SET_SYNC_ROUNDTRIP");
-                    fill(base, total, seed + 100);
-                    h2d = record(aclrtMemcpyAsync(hbm.va, total, base, total, ACL_MEMCPY_HOST_TO_DEVICE, stream), "aclrtMemcpyAsync_H2D_HAL_HBM");
-                    if (!h2d) check(aclrtSynchronizeStream(stream), "sync no-set H2D");
-                    memset(base, 0, total);
-                    d2h = record(aclrtMemcpyAsync(base, total, hbm.va, total, ACL_MEMCPY_DEVICE_TO_HOST, stream), "aclrtMemcpyAsync_D2H_HAL_HBM");
-                    if (!d2h) check(aclrtSynchronizeStream(stream), "sync no-set D2H");
-                    if (!h2d && !d2h) verify(base, total, seed + 100, "ACL_NO_SET_ASYNC_ROUNDTRIP");
+                    check(aclrtMemcpyAsync(base, total, acl.device, total, ACL_MEMCPY_DEVICE_TO_HOST, acl.stream), "ACL async D2H full region");
+                    check(aclrtSynchronizeStream(acl.stream), "sync D2H");
+                    verify(base, total, seed, "ACL_ASYNC_ROUNDTRIP_ALL_ALLOCATIONS");
                 }
-                barrier(); barrier();
+                barrier();
+                verify(base, total, seed, "PEER_SEES_D2H_WRITE");
+                barrier();
             }
-            if (stream) cleanup(aclrtDestroyStream(stream), "destroy no-set stream");
-            if (acl_buffer) cleanup(aclrtFree(acl_buffer), "free no-set ACL buffer");
-            printf("CASE_RESULT rank=%d ACL_NO_SET %s\n", rank, result ? "FAIL" : "PASS");
+            printf("CASE_PASS rank=%d ACL_ASYNC_H2D_D2H total_bytes=%zu\n", rank, total);
         }
         barrier();
         // Unmap everywhere before any owner releases its allocation.
@@ -220,10 +194,8 @@ static int worker(const MultiOptions& opt) {
         if (handles[i]) cleanup(halMemRelease(handles[i]), "release handle");
     }
     if (base) cleanup(halMemAddressFree(base), "free contiguous VA");
+    if (context) cleanup(aclrtDestroyContext(context), "aclrtDestroyContext");
     if (acl_init) cleanup(aclFinalize(), "aclFinalize");
-    if (hal_open) { halDevCloseIn input{}; cleanup(halDeviceClose(device, &input), "halDeviceClose"); }
-    if (tsd_open) cleanup(close_tsd(device), "TsdClose");
-    if (tsd) cleanup(dlclose(tsd), "dlclose TSD");
     close(opt.fd);
     result = result || cleanup_failed;
     printf("WORKER_RESULT rank=%d ret=%d\n", rank, result);
@@ -239,10 +211,10 @@ int main(int argc, char** argv) {
         for (int i = 1; i < argc; ++i) {
             std::string key = argv[i];
             if (key == "--help") {
-                puts("multi_share --devices 1,2,4 --numa-nodes 6,4,0 --size-mib 32 --io-dir DIR [--copy-api acl-no-set|none]\n"
+                puts("multi_share --devices 1,2,4 --numa-nodes 6,4,0 --size-mib 32 --io-dir DIR\n"
                      "One exec worker per device; equal NUMA Host allocations; identical contiguous VA.\n"
-                     "CPU, buffered AIO, ACL calls without SetDevice (default); none skips ACL diagnostics.\n"
-                     "HAL remains open during ACL diagnostics; no Direct IO or HostRegister.\n"
+                     "CPU, buffered AIO and ACL asynchronous H2D/D2H over the entire shared region.\n"
+                     "Initialize with aclInit + aclrtCreateContext; HAL allocates/shares Host memory. No Direct IO.\n"
                      "Unset ASCEND_RT_VISIBLE_DEVICES; IDs refer to the HAL device namespace.\n"
                      "Use timeout -k 5 180 externally. Size is per process and must be a positive even MiB value.");
                 return 0;
@@ -252,10 +224,6 @@ int main(int argc, char** argv) {
             if (key == "--devices") opt.devices = list(value);
             else if (key == "--numa-nodes") opt.nodes = list(value);
             else if (key == "--io-dir") opt.io_dir = value;
-            else if (key == "--copy-api") {
-                if (value != "none" && value != "acl-no-set") throw std::runtime_error("invalid copy API");
-                opt.copy_api = value;
-            }
             else if (key == "--size-mib") {
                 auto mib = number(value);
                 if (!mib || mib % 2 || mib > SIZE_MAX / (1024 * 1024)) throw std::runtime_error("invalid size MiB");
@@ -308,8 +276,7 @@ int main(int argc, char** argv) {
         std::vector<uint64_t> tokens;
         for (int fd : sockets) tokens.push_back(receive_word(fd));
         for (int fd : sockets) for (auto token : tokens) send_word(fd, token);
-        size_t barriers = 4 * count + 3;
-        if (opt.copy_api == "acl-no-set") barriers += 2 * count + 1;
+        const size_t barriers = 6 * count + 3;
         for (size_t phase = 0; phase < barriers; ++phase) {
             for (int fd : sockets) check(receive_word(fd), "worker barrier arrived");
             for (int fd : sockets) send_word(fd, 0);

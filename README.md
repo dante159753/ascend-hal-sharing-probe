@@ -31,55 +31,48 @@ ldd build/device_share
 
 在容器中运行时使用 **vLLM-Ascend 0.23.0 或更新且适配 A5 的镜像**，挂载本机驱动、目标设备节点及 ext4/XFS 测试目录；不要挂载其他版本 toolkit 覆盖镜像。具体容器设备授权按机器已有运维配置执行。测试程序不需要访问所有 NPU。
 
-私有仓库克隆需要先配置 GitHub 认证，也可在已登录的开发机下载代码后传到 A5。
-
 ## 多卡 NUMA Host 共享 demo
 
-`multi_share` 为 `--devices` 中每张卡启动一个独立 exec 工作进程，另有一个仅交换 handle 和同步消息的协调进程。`--numa-nodes` 与设备列表一一对应，`--size-mib` 是**每个进程**的分配大小，必须为正的 2 MiB 倍数。支持 1～64 个不重复的设备 ID。
+`multi_share` 为每张指定的卡启动一个独立 exec 工作进程，另有一个仅交换 handle 和同步消息的协调进程。工作进程只使用 **`aclInit → aclrtCreateContext`** 初始化；Runtime 内部负责 TSD、HAL device open 和当前 context。随后仍用 HAL 分配、导出、导入和映射 NUMA Host 内存。不手动调用 `halDeviceOpen`、`aclrtSetDevice` 或 HostRegister。
 
 ```bash
+# 首次使用先按上面的“编译”章节配置 CANN 和驱动库路径。
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target multi_share -j
 
-# 查看本机拓扑后填写设备号和对应的 Host NUMA 节点号。
+# 按本机拓扑选择空闲卡和对应 NUMA 节点。
 npu-smi info -t topo
 lscpu
 mkdir -p "$HOME/hal-probe-io"
 unset ASCEND_RT_VISIBLE_DEVICES
-timeout -k 5 180 build/multi_share \
-  --devices 1,2,4 --numa-nodes 6,4,0 \
-  --size-mib 32 --io-dir "$HOME/hal-probe-io"
 
-# 只验证共享、CPU、buffered AIO，跳过 ACL context 诊断。
-timeout -k 5 180 build/multi_share \
-  --devices 1,2,4 --numa-nodes 6,4,0 \
-  --size-mib 32 --io-dir "$HOME/hal-probe-io" --copy-api none
+timeout -k 5 180 build/multi_share --devices 1,2,4 --numa-nodes 6,4,0 --size-mib 32 --io-dir "$HOME/hal-probe-io"
 ```
 
-上述卡号/NUMA 对应关系来自测试 A2，其他机器请按实际拓扑填写。容器必须暴露所有选中的设备。程序要求取消 `ASCEND_RT_VISIBLE_DEVICES`，避免 HAL 和 ACL 的设备编号重排。
+- `--devices`：不重复的设备 ID，数量为 1～64；容器需暴露全部选中设备。
+- `--numa-nodes`：与设备列表一一对应的 Host NUMA 节点号。上例对应测试 A2，其他机器按实际拓扑填写。
+- `--size-mib`：**每个进程**的 Host 分配大小，默认 2 MiB，必须是正的 2 MiB 倍数。上例共分配 96 MiB Host 内存，每个进程都映射完整 96 MiB，并在自己的 NPU 上分配等大的测试 HBM。
+- `--io-dir`：已有、可写的测试目录。只执行 buffered Linux AIO，文件打开后立即 unlink，不测试 Direct I/O。
 
-每个工作进程依次执行：
+取消 `ASCEND_RT_VISIBLE_DEVICES`，避免 HAL 和 ACL 设备编号重排。程序会查询每个工作进程分配的 HBM 的 HAL device ID，确认与所选设备一致。
 
-1. 将 CPU affinity 绑定到所选 NUMA 节点与当前允许 CPU 集的交集。
-2. `TsdOpen(device, 0) → halSetRuntimeApiVer → halDeviceOpen(device)`。
-3. 用 `MEM_HOST_NUMA_SIDE`、`prop.devid=numa_node`、`MEM_HUGE_PAGE_TYPE`、`MEM_DDR_TYPE` 申请 Host 内存，不退回普通 Host 分配。驱动若提供属性查询符号，也会检查返回属性；查询符号缺失会明确输出，不能据此声称独立验证了物理页位置。
-4. rank 0 预留 `进程数 × 单进程大小` 的 VA 区间并广播基址；其他进程指定同一个地址调用 `halMemAddressReserve`，返回地址不一致即失败。
-5. 交换所有共享 handle，其他进程的 handle 通过 `halGetHostID` 得到的 Host ID 导入。按 `base + owner_rank × bytes_each` 逐块 `halMemMap`。因此每个进程相同的指针对应相同的共享数据。
-6. 每个进程轮流写整个连续区域，所有进程全量校验；每个进程也轮流对整个区域执行 buffered Linux AIO 读写，覆盖跨映射边界的请求，并校验数据。文件打开后立即 unlink，不使用 Direct I/O。
-7. 默认 `--copy-api acl-no-set`：保留 HAL device open，调用 `aclInit`，**不调用 `aclrtSetDevice`**。分别探测 `aclrtMalloc`、`aclrtCreateStream`、同步及异步 H2D/D2H。另用 HAL 创建本卡 HBM 作为拷贝端点，使 `aclrtMalloc` 失败不会阻止拷贝接口探测；stream 创建失败时仍探测默认 stream（NULL）。有任何接口失败，最终返回非零，不能将其写成拷贝通过。
-8. 所有进程完成访问后统一解除映射，再释放 handle、VA、设备和 TSD。
+CPU affinity 绑定到所选 NUMA 节点与当前允许 CPU 集的交集。Host 分配使用 `MEM_HOST_NUMA_SIDE`、`prop.devid=numa_node`、`MEM_HUGE_PAGE_TYPE`、`MEM_DDR_TYPE`，不退回普通 Host 分配。若驱动提供属性查询接口，会核对属性；缺失时明确输出，不据此声称独立验证了物理页位置。
 
-2026-09-20 在 A2 910B3、0.23.0 镜像、CANN 9.1.0、驱动 25.5.2 上实测：
+rank 0 预留 `进程数 × 单进程大小` 的 VA 区间并广播基址，其他进程指定同一个地址预留，地址不一致即失败。交换 handle 后，其他进程的内存通过 `halGetHostID` 返回的 Host ID 导入，按 `base + owner_rank × bytes_each` 逐块映射。各进程相同的指针对应相同的共享内容。
 
-| 用例 | 结果 |
-|---|---|
-| 卡 1/2/4，NUMA 6/4/0，各分配 2 MiB 或 32 MiB | 创建、导入、映射均通过 |
-| 所有进程同一连续 VA 基址 | 均为 `0x12c000000000`，总长 6 MiB / 96 MiB |
-| 所有进程 CPU 读写与相互可见性 | 通过 |
-| 所有进程 buffered AIO 读写与完整数据校验 | 通过 |
-| 跳过 SetDevice 的 ACL malloc、stream、同步/异步 H2D/D2H | 均返回 `107002`，当前 context 为空 |
+CPU、AIO、H2D/D2H 都覆盖整个连续区域及映射边界。每个进程轮流写入，所有进程完整校验，避免数据竞争。异步 H2D 完成后清空 Host 区域，再 D2H 回写并完整校验；其他进程随后验证能看到本次 D2H 写入。结束时先解除所有进程的映射，再释放 handle、VA 和 context。
 
-HAL 打开设备不等于创建 ACL Runtime context。另一次对照中，在手动 HAL open 后调用 `aclrtSetDevice`，Runtime 再次打开设备而得到 HAL `10`（重复初始化），ACL 返回 `507033`。当前 demo 保留用户指定的跳过 SetDevice 路径，明确呈现这个限制；没有把它替换成 ACL 初始化来声称成功。以上结果是 A2 实测，A5 仍需运行确认。
+2026-09-20 在 A2 910B3、vLLM-Ascend 0.23.0、CANN 9.1.0、驱动 25.5.2 上实测：
+
+| 用例 | 每进程 2 MiB | 每进程 32 MiB |
+|---|---|---|
+| 卡 1/2/4，NUMA 6/4/0，Host 创建/导入/映射 | 通过 | 通过 |
+| 三个进程同址连续映射 | 总长 6 MiB | 总长 96 MiB |
+| CPU 读写及跨进程可见性 | 通过 | 通过 |
+| buffered AIO 读写及完整数据校验 | 通过 | 通过 |
+| 各卡 ACL 异步 H2D/D2H，其他进程验证 D2H 结果 | 通过 | 通过 |
+
+本次公共基址均为 `0x12c180000000`；程序动态协商，不硬编码此值。成功时输出 `MULTI_RESULT PASS`，退出码为 0。A5 尚需实机验证。旧 `--copy-api` 诊断选项已移除。
 
 ## 一键运行两种模式
 
@@ -154,7 +147,7 @@ timeout -k 5 120 build/hal_map_probe device 0 2
 
 ## 已知 A2 对照
 
-此前在 A2 910B3、驱动 25.5.2/HAL 7.35.23、vLLM-Ascend 0.23.0/CANN 9.1.0 上：ACL 初始化的 Host 共享 CPU/ACL/buffered AIO 通过；O_DIRECT AIO 返回 EFAULT；Device 直接导入返回 8；Host 导入后 SetAccess Device 返回 65534。旧 `hal_map_probe` 未调用 `TsdOpen`，其 DeviceOpen 返回 4；补齐 TSD 启动后 DeviceOpen 成功，见新的 `multi_share`。这些是 A2 对照，不是 A5 预期结果。
+此前在 A2 910B3、驱动 25.5.2/HAL 7.35.23、vLLM-Ascend 0.23.0/CANN 9.1.0 上：ACL 初始化的 Host 共享 CPU/ACL/buffered AIO 通过；O_DIRECT AIO 返回 EFAULT；Device 直接导入返回 8；Host 导入后 SetAccess Device 返回 65534。旧 `hal_map_probe` 未调用 `TsdOpen`，其 DeviceOpen 返回 4；补齐 TSD 启动后 DeviceOpen 成功；当前 `multi_share` 通过显式 ACL context 统一完成设备初始化。这些是 A2 对照，不是 A5 预期结果。
 
 ## 参考
 
