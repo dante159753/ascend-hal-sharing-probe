@@ -14,6 +14,7 @@ struct Options {
 inline Options options;
 
 inline void send_word(int fd, uint64_t value) {
+    if (log_role) log_line(1, "IPC SEND fd=%d value=0x%llx", fd, (unsigned long long)value);
     auto* ptr = reinterpret_cast<char*>(&value);
     size_t sent = 0;
     while (sent < sizeof(value)) {
@@ -24,6 +25,7 @@ inline void send_word(int fd, uint64_t value) {
     }
 }
 inline uint64_t receive_word(int fd) {
+    if (log_role) log_line(1, "IPC WAIT fd=%d", fd);
     uint64_t value;
     auto* ptr = reinterpret_cast<char*>(&value);
     size_t received = 0;
@@ -33,6 +35,7 @@ inline uint64_t receive_word(int fd) {
         if (n <= 0) throw std::runtime_error("IPC receive / peer closed or timed out");
         received += n;
     }
+    if (log_role) log_line(2, "IPC RECEIVED fd=%d value=0x%llx", fd, (unsigned long long)value);
     return value;
 }
 inline unsigned long long number(const std::string& text) {
@@ -95,15 +98,18 @@ inline int launch(int argc, char** argv, int (*worker)(bool, int, size_t), size_
             perror("execv"); _exit(127);
         }
         close(sockets[1]);
+        if (log_role) log_line(0, "RUN creator_pid=%d importer_pid=%d device=%d bytes=%zu", getpid(), child, options.device, options.bytes);
         int result = worker(false, sockets[0], options.bytes);
         int status;
         pid_t waited;
         do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
         if (waited < 0) throw std::runtime_error("waitpid");
-        printf("PROCESS_RESULT creator=%d importer_wait_status=%d\n", result, status);
+        if (log_role) log_line(0, "PROCESS_RESULT %s creator=%d importer_pid=%d importer_wait_status=%d", result || status ? "FAIL" : "PASS", result, child, status);
+        else printf("PROCESS_RESULT creator=%d importer_wait_status=%d\n", result, status);
         return result || status ? 1 : 0;
     } catch (const std::exception& error) {
-        fprintf(stderr, "LAUNCH_ERROR %s\n", error.what());
+        if (log_role) log_line(0, "LAUNCH_ERROR %s", error.what());
+        else fprintf(stderr, "LAUNCH_ERROR %s\n", error.what());
         return 2;
     }
 }

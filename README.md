@@ -59,6 +59,28 @@ Creator 可由 CPU 读写原始 Host 映射；Importer 不直接解引用 Device
 
 2026-09-20 在 A2 的 0.23.0/CANN 9.1.0 容器中编译和参数检查通过，确认可执行文件不链接 ACL/runtime。由于 A2 卡 0 有其他进程，本次没有运行固定设备 0 的硬件用例；A5 结果需在目标环境验证。
 
+### Device 日志格式
+
+每行以 `[pid=进程号 creator|importer|launcher]` 开头。顶层 `SETUP / SHARE / TEST / SYNC / CLEANUP / PASS / RESULT` 表示阶段和测试结果；缩进两格的 `CALL` 打印调用前的真实参数，缩进四格的 `RETURN / OUTPUT` 打印返回值、VA、handle 或共享 token。`halMemcpy` 明确列出 `dst`、`src`、字节数、方向名称/数值和设备号。IPC 日志区分发送、等待和收到消息；最后 `PROCESS_RESULT` 汇总两个进程的退出状态。
+
+格式示意（地址、PID 为示例，不是实测结果）：
+
+```text
+[pid=123 creator] TEST CREATOR_HOST_TO_HBM: shared Host source -> H2D -> separate HBM -> D2H -> verify seed 101
+[pid=123 creator]   CALL halMemcpy(dst=0x200000, dest_max=1048576, src=0x100000, count=1048576, info={dir=DRV_MEMCPY_HOST_TO_DEVICE(1), devid=0})
+[pid=123 creator]     RETURN H2D shared HOST source -> HBM destination ret=0 [OK]
+[pid=124 importer]   IPC WAIT fd=4
+```
+
+调用信息在执行前打印，即使接口失败或卡住也能定位。单行先组装再写出，减少两个进程输出在同一行内交错。可保存日志后按 PID 或角色筛选：
+
+```bash
+set -o pipefail
+timeout -k 5 120 build/device_share --size-mib 1 2>&1 | tee device-share.log
+grep ' creator]' device-share.log
+grep ' importer]' device-share.log
+```
+
 ## 多卡 NUMA Host 共享 demo
 
 `multi_share` 为每张指定的卡启动一个独立 exec 工作进程，另有一个仅交换 handle 和同步消息的协调进程。工作进程只使用 **`aclInit → aclrtCreateContext`** 初始化；Runtime 内部负责 TSD、HAL device open 和当前 context。随后仍用 HAL 分配、导出、导入和映射 NUMA Host 内存。不手动调用 `halDeviceOpen`、`aclrtSetDevice` 或 HostRegister。
