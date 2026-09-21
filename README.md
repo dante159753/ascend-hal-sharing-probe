@@ -26,7 +26,7 @@ VA 预留显式使用 `MEM_NORMAL_PAGE_TYPE`，不再依赖当前 SDK 未定义�
 
 `hal_host_io.cpp` 可单独复制到目标机器编译，不依赖本仓库的其他文件或 CMake。仍需已安装的 CANN/HAL 开发头文件及库。
 
-程序执行 `aclInit → aclrtSetDevice(0)`，以 `Reserve → halMemCreate → Map` 申请 2 MiB、`MEM_HOST_SIDE / MEM_NORMAL_PAGE_TYPE / MEM_DDR_TYPE` 的 Host 内存，分别执行 O_DIRECT 和普通文件的同步 `pwrite/pread` 并全量校验。文件按 PID 命名，结束后删除；一个模式失败仍继续另一个模式。任一测试或清理失败返回 1。它不是 Linux AIO 测试。
+程序执行 `aclInit → aclrtSetDevice(0)`，以 `Reserve → halMemCreate → Map` 申请 `MEM_HOST_SIDE / MEM_NORMAL_PAGE_TYPE / MEM_DDR_TYPE` 的 Host 内存，大小由 `--size-mib` 指定，默认 2 MiB。只执行 O_DIRECT 的同步 `pwrite/pread` 并全量校验，不执行 buffered I/O。单次读写最多 1 GiB，大 buffer 分段完成；文件按 PID 命名，结束后删除。任一测试或清理失败返回 1。它不是 Linux AIO 测试。
 
 ```bash
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -38,10 +38,12 @@ g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic hal_host_io.cpp -o hal_host_io \
   -Wl,-rpath,"$CANN_ROOT/lib64" -Wl,-rpath,"$DRIVER_ROOT/lib64/driver" \
   -lascendcl -lascend_hal
 
-./hal_host_io /mnt/txh/yz
+./hal_host_io /mnt/txh/yz --size-mib 64
 ```
 
-目录参数可省略，默认当前目录；目录须已存在。本例自动选址，没有跨进程指定 VA，因此按实际 2 MiB 预留即可。2026-09-20 在 A2 0.23.0/CANN 9.1.0 容器中直接编译和参数检查通过，本次未执行硬件和文件 I/O 测试。
+目录参数可省略，默认当前目录；目录须已存在并支持 O_DIRECT。`--size-mib` 接受正整数 MiB，例如 `--size-mib 2048` 分配 2 GiB。程序自动选址，按配置大小预留、创建和映射内存；日志打印实际地址、每次读写的长度、偏移及错误码。
+
+2026-09-21 在 A2 0.23.0/CANN 9.1.0 中单文件编译、链接及参数检查通过；本次未执行硬件和文件 I/O 测试。
 
 ### 编译其他共享测试
 
