@@ -7,17 +7,19 @@
 - `trans/ascend/hal/hal_memory.h`、`trans/ascend/hal/hal_memory.cc`
 - `status/status.h`
 
-`data_strategy.h`、`data_strategy.cc` 基于同一提交，仅调整映射位置及对应的地址查询、释放位置，并增加本地映射成功日志。对外接口、逻辑 slot 编号、HAL 分配属性、调用顺序和失败回退保持不变。
+`data_strategy.h`、`data_strategy.cc` 基于同一提交，改为每个 rank 的映射独立预留 VA，并调整地址查询和释放逻辑。对外接口、逻辑 slot 编号、HAL 分配属性、句柄交换和 Huge → Normal 回退保持不变。
 
-每个进程都把自己创建的 Host 内存映射到预留区起点，随后按 rank 升序放置其他进程的导入映射。例如三个 rank 的地址布局如下，各列间距为 `rankStride`：
+每个进程为本地 Host 内存和每个 peer 的 Device 导入分别调用一次 `halMemAddressReserve`，Map 始终使用该次 Reserve 返回的起点。`mappings_[rank].addr` 保存该逻辑 rank 的实际 VA；不同 rank 的 VA 不要求连续。
 
-| 当前进程 | `base` | `base + rankStride` | `base + 2 * rankStride` |
-|---|---|---|---|
-| rank 0 | Host rank 0 | Device rank 1 | Device rank 2 |
-| rank 1 | Host rank 1 | Device rank 0 | Device rank 2 |
-| rank 2 | Host rank 2 | Device rank 0 | Device rank 1 |
+例如 rank 1 进程有三个独立预留区：
 
-`DataAt` / `DeviceDataAt` 仍按全局逻辑 slot 编号访问原来的 owner；各进程对应同一 slot 的 VA 可以不同。清理时按相同的位置换算 Unmap。此布局用于验证 A5 中非零偏移的本地 Host 映射在 URMA 注册阶段失败的问题，尚未确认能在 A5 上规避该问题。
+| 逻辑 rank | 地址 | 映射类型 |
+|---|---|---|
+| 0 | `mappings_[0].addr`，独立 Reserve 返回值 | Device 导入 rank 0 |
+| 1 | `mappings_[1].addr`，独立 Reserve 返回值 | 本地 Host rank 1 |
+| 2 | `mappings_[2].addr`，独立 Reserve 返回值 | Device 导入 rank 2 |
+
+`DataAt` / `DeviceDataAt` 仍按全局逻辑 slot 编号找到对应 rank，再加上 rank 内的 slot 偏移。释放时先 Unmap 所有成功映射，释放导入及本地句柄，再逐个 AddressFree；中途失败也会释放已经预留的 VA。此布局用于验证 A5 上共享预留区内部地址 Map 失败的问题，尚未确认独立 Reserve 能在 A5 上规避该问题。
 
 `trans/device.cc` 保留 UCM 的 `Device::Init/Setup/Reset/Finalize` 函数体原样；仅去掉本程序不需要的 stream/buffer 工厂依赖。`logger/logger.h` 提供带 PID/rank 的终端日志。
 
@@ -58,12 +60,12 @@ cmake --build build/ucm_data_strategy --target data_strategy_demo -j
   --rank 1 --device 1 --ranks 2 --slot-size 8388608 --slots-per-rank 256
 ```
 
-每个 rank 分配 2 GiB，slot 为 8 MiB。执行顺序保持 UCM 原样：
+每个 rank 分配 2 GiB，slot 为 8 MiB。执行顺序：
 
 1. 入口 `Device::Init` 调用 `aclInit`；`DataStrategy::Setup` 内 `Device::Setup` 调用 `aclrtSetDevice`。
-2. 查询推荐粒度，计算 rankStride 和整个预留区长度，Reserve → Create → Map 本 rank 到 `base`。成功时打印 `HAL local mapping` 和 `va_offset=0`。先尝试 Huge，任何本地初始化失败时按原逻辑释放并回退 Normal。
+2. 查询推荐粒度，计算 rankStride 和每个 rank 的预留长度。Reserve → Create → Map 本 rank 到自己的 Reserve 起点。成功时打印 `HAL local mapping` 和 `va_offset=0`。先尝试 Huge，任何本地初始化失败时按原逻辑释放并回退 Normal。
 3. 导出本 rank 的句柄并禁用白名单，`SetRankDesc` 打印 DESC 行。
-4. 按 rank 顺序获取其他 rank 的 desc，导入到当前 device，依次映射到本地 Host 内存后面的区域。
+4. 按 rank 顺序获取其他 rank 的 desc，Import 到当前 device → 为该 rank 独立 Reserve → Map 到本次 Reserve 返回的起点。每个 peer 成功时同样打印 `va_offset=0`。
 5. 成功后打印每个 rank 第一个 slot 的 `HostAccessibleOf`、`DataAt`、`DeviceDataAt`，然后等待 Enter，保持本地分配及导入映射存活。
 6. **所有 rank 都打印 `SETUP PASS` 后**，再在各终端按 Enter。析构按原逻辑 Unmap、Release、AddressFree，随后入口调用 `aclFinalize`。
 
@@ -73,7 +75,7 @@ cmake --build build/ucm_data_strategy --target data_strategy_demo -j
 
 这个入口只复现初始化和地址查询，不增加 CPU 写入、ACL copy 或 AIO 测试。`SETUP PASS` 只代表 Setup 成功，不代表已验证数据传输。
 
-## 使用当前 8 GiB / 64 GiB 参数
+## 使用每 rank 8 GiB、共 8 个 rank 的参数
 
 ```bash
 ./build/ucm_data_strategy/data_strategy_demo \
@@ -81,7 +83,7 @@ cmake --build build/ucm_data_strategy --target data_strategy_demo -j
   --slot-size 8588328960 --slots-per-rank 1
 ```
 
-这里用单个大 slot 精确构造 `data_bytes=8588328960`。若驱动返回 `alloc_granularity=2097152`，则 `rank_stride=8589934592`、`reserve_bytes=68719476736`，与之前报错的分配大小一致。VA 仍由 HAL 自动选择，本地映射位置已从 `base + rankStride` 改为 `base`。
+这里用单个大 slot 精确构造 `data_bytes=8588328960`。若驱动返回 `alloc_granularity=2097152`，则 `rank_stride=8589934592`、`reserve_bytes_per_rank=8589934592`。完整初始化后，每个进程有 8 次独立的 8 GiB VA 预留，总计 64 GiB，而不再是一次预留连续的 64 GiB。每段 Reserve 长度向上对齐到 1 GiB，Map 长度仍为 rankStride；日志打印每段 VA 和预留长度。
 
 若只定位本地 Map 失败，启动这一个进程即可；若本地 Map 成功进入句柄交换，需要再启动其余 rank 并交换句柄。若要保持业务中的 slot 划分，也可直接传入业务的真实 slot-size 和 slots-per-rank。
 
@@ -89,4 +91,6 @@ cmake --build build/ucm_data_strategy --target data_strategy_demo -j
 
 2026-09-24 初版：使用 Linux GCC 13、真实 ACL/HAL 9.0.0 源码头文件、fmt 11.2.0，以 `-Wall -Wextra -Wpedantic -Werror` 编译通过。独立模拟 SDK 验证了双进程 DESC 交互、Huge 失败回退 Normal、8 GiB / 64 GiB 参数计算、Map 返回 8 和输入 EOF 时的清理。模拟检查文件在仓库外，模拟库未加入 demo 构建。
 
-同日调整布局后：重新编译通过，模拟检查覆盖 rank 0/1/2 的本地起点映射、peer 连续排列、逻辑 slot 地址查询以及部分 peer 映射失败时的清理；原有交互和失败回退检查也通过。此次验证未在 A5 实机运行。
+同日首次调整布局后：重新编译通过，模拟检查覆盖 rank 0/1/2 的本地起点映射、peer 连续排列、逻辑 slot 地址查询以及部分 peer 映射失败时的清理；原有交互和失败回退检查也通过。此次验证未在 A5 实机运行。
+
+同日改为独立 Reserve 后：重新编译通过，模拟检查覆盖三个 owner 的独立 VA 起点映射、peer Reserve/Map 中途失败的清理，以及不连续 VA 下各 slot 的地址查询。另以每 rank 3 MiB 数据、4 MiB Map 长度、1 GiB Reserve 长度检查不同对齐长度的处理。原有双进程交互和失败回退检查也通过；待 A5 实机确认。

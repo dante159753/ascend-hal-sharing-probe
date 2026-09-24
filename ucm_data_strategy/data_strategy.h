@@ -40,14 +40,13 @@ class DataStrategy {
 #if UCM_RUNTIME_ASCEND_HAL
     struct Mapping;
     std::vector<Mapping> mappings_;
-    void* base_{nullptr};
     size_t owner_{};
     int32_t deviceId_{-1};
     size_t rankStride_{};
 
     Status LocalSetup(size_t dataBytes, size_t nRanks, Trans::Hal::PageType pageType);
     Status CrossRankSetup(CtrlLayout& ctrl, size_t timeoutMs);
-    std::byte* RankAddress(size_t rank) const;
+    Status ReserveRankAddress(size_t rank);
     void Reset();
 #endif
 

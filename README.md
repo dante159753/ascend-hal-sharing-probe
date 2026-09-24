@@ -11,7 +11,7 @@
 
 ### UCM 当前内存分配逻辑复现
 
-新增 [ucm_data_strategy](ucm_data_strategy/README.md)：保留 UCM DataStrategy 对外接口和 HAL 封装，每个进程将本地 Host 内存映射到预留区起点，peer 映射按 rank 顺序排列在后。每次运行只负责一个进程，发布句柄时打印、获取 peer 句柄时等待终端输入。支持指定 rank、device、rank 数、slot 大小、slot 数和 Setup 超时。
+新增 [ucm_data_strategy](ucm_data_strategy/README.md)：保留 UCM DataStrategy 对外接口和 HAL 封装，为每个 rank 的映射单独预留 VA，本地 Host 和 peer Device 内存都映射到各自 Reserve 返回的起点。每次运行只负责一个进程，发布句柄时打印、获取 peer 句柄时等待终端输入。支持指定 rank、device、rank 数、slot 大小、slot 数和 Setup 超时。
 
 ```bash
 cmake -S ucm_data_strategy -B build/ucm_data_strategy -DCMAKE_BUILD_TYPE=Debug

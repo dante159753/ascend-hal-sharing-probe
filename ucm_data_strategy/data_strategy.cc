@@ -41,6 +41,7 @@ namespace Hal = Trans::Hal;
 
 struct DataStrategy::Mapping {
     Hal::MemHandle handle{nullptr};
+    void* addr{nullptr};
     bool mapped{false};
 };
 #endif
@@ -102,12 +103,25 @@ Status DataStrategy::Setup(CtrlLayout& ctrl, int32_t deviceId, size_t myRank, si
 }
 
 #if UCM_RUNTIME_ASCEND_HAL
-std::byte* DataStrategy::RankAddress(size_t rank) const
+Status DataStrategy::ReserveRankAddress(size_t rank)
 {
-    // Keep the local host mapping first, followed by peers in rank order.
-    size_t mappingIdx = rank < owner_ ? rank + 1 : rank;
-    if (rank == owner_) { mappingIdx = 0; }
-    return static_cast<std::byte*>(base_) + mappingIdx * rankStride_;
+    constexpr size_t vaAlignment = Hal::kAddressAlignment;
+    const size_t reserveBytes = (rankStride_ + vaAlignment - 1) / vaAlignment * vaAlignment;
+    Status status = Hal::MemAddressReserve(&mappings_[rank].addr, reserveBytes);
+    if (status.Failure()) {
+        UC_ERROR(
+            "halMemAddressReserve failed: owner={} device={} rank={} reserve_bytes={} status={}",
+            owner_, deviceId_, rank, reserveBytes, status);
+        return status;
+    }
+    if (mappings_[rank].addr == nullptr) {
+        UC_ERROR("Invalid HAL VA reservation: owner={} device={} rank={} reserve_bytes={}",
+                 owner_, deviceId_, rank, reserveBytes);
+        return Status::Error("HAL did not return a valid ptr");
+    }
+    UC_INFO("HAL VA reservation: owner={} device={} rank={} addr={} reserve_bytes={}",
+            owner_, deviceId_, rank, mappings_[rank].addr, reserveBytes);
+    return Status::OK();
 }
 
 void DataStrategy::Reset()
@@ -115,7 +129,7 @@ void DataStrategy::Reset()
     // reset for map
     for (size_t rank = 0; rank < mappings_.size(); ++rank) {
         if (!mappings_[rank].mapped) { continue; }
-        std::byte* addr = RankAddress(rank);
+        void* addr = mappings_[rank].addr;
         Status status = Hal::MemUnmap(addr);
         if (status.Failure()) {
             UC_ERROR("HAL unmap failed: owner={} device={} rank={} addr={} status={}", owner_,
@@ -137,15 +151,15 @@ void DataStrategy::Reset()
     }
     // for owner, MemRelease is used to release physical memory
     if (owner_ < mappings_.size()) { release(owner_); }
-    if (base_ != nullptr) {
-        Status status = Hal::MemAddressFree(base_);
+    for (size_t rank = 0; rank < mappings_.size(); ++rank) {
+        if (mappings_[rank].addr == nullptr) { continue; }
+        Status status = Hal::MemAddressFree(mappings_[rank].addr);
         if (status.Failure()) {
-            UC_ERROR("HAL address free failed: owner={} device={} addr={} status={}", owner_,
-                     deviceId_, base_, status);
+            UC_ERROR("HAL address free failed: owner={} device={} rank={} addr={} status={}",
+                     owner_, deviceId_, rank, mappings_[rank].addr, status);
         }
     }
     mappings_.clear();
-    base_ = nullptr;
     rankStride_ = 0;
 }
 
@@ -171,30 +185,15 @@ Status DataStrategy::LocalSetup(size_t dataBytes, size_t nRanks, Hal::PageType p
     }
     rankStride_ = (dataBytes + allocGranularity - 1) / allocGranularity * allocGranularity;
     mappings_.resize(nRanks);
-    const size_t reserveBytes =
-        (rankStride_ * nRanks + vaAlignment - 1) / vaAlignment * vaAlignment;
+    const size_t reserveBytes = (rankStride_ + vaAlignment - 1) / vaAlignment * vaAlignment;
     UC_INFO(
         "HAL host allocation: owner={} device={} ranks={} data_bytes={} "
-        "rank_stride={} reserve_bytes={} page_type={} alloc_granularity={}",
+        "rank_stride={} reserve_bytes_per_rank={} page_type={} alloc_granularity={}",
         owner_, deviceId_, nRanks, dataBytes, rankStride_, reserveBytes,
         static_cast<uint32_t>(pageType), allocGranularity);
 
-    status = Hal::MemAddressReserve(&base_, reserveBytes);
-    if (status.Failure()) {
-        UC_ERROR(
-            "halMemAddressReserve failed: owner={} device={} page_type={} ranks={} "
-            "rank_stride={} reserve_bytes={} status={}",
-            owner_, deviceId_, static_cast<uint32_t>(pageType), nRanks, rankStride_, reserveBytes,
-            status);
-        return status;
-    }
-    if (base_ == nullptr) {
-        UC_ERROR(
-            "Invalid HAL VA reservation: owner={} device={} page_type={} addr={} "
-            "va_alignment={} reserve_bytes={}",
-            owner_, deviceId_, static_cast<uint32_t>(pageType), base_, vaAlignment, reserveBytes);
-        return Status::Error("HAL did not return a valid ptr");
-    }
+    status = ReserveRankAddress(owner_);
+    if (status.Failure()) { return status; }
     status = Hal::MemCreate(&mappings_[owner_].handle, rankStride_, pageType);
     if (status.Failure()) {
         UC_ERROR(
@@ -204,7 +203,7 @@ Status DataStrategy::LocalSetup(size_t dataBytes, size_t nRanks, Hal::PageType p
             status);
         return status;
     }
-    std::byte* local = RankAddress(owner_);
+    void* local = mappings_[owner_].addr;
     status = Hal::MemMap(local, rankStride_, mappings_[owner_].handle);
     if (status.Failure()) {
         UC_ERROR(
@@ -278,7 +277,9 @@ Status DataStrategy::CrossRankSetup(CtrlLayout& ctrl, size_t timeoutMs)
             return {status.Underlying(),
                     fmt::format("HAL peer import failed: rank={} status={}", rank, status)};
         }
-        std::byte* addr = RankAddress(rank);
+        status = ReserveRankAddress(rank);
+        if (status.Failure()) { return status; }
+        void* addr = mappings_[rank].addr;
         status = Hal::MemMap(addr, rankStride_, mappings_[rank].handle);
         if (status.Failure()) {
             UC_ERROR(
@@ -289,8 +290,8 @@ Status DataStrategy::CrossRankSetup(CtrlLayout& ctrl, size_t timeoutMs)
                     fmt::format("HAL peer map failed: rank={} status={}", rank, status)};
         }
         mappings_[rank].mapped = true;
-        UC_INFO("HAL peer mapping: owner={} device={} rank={} addr={} bytes={}", owner_, deviceId_,
-                rank, static_cast<void*>(addr), rankStride_);
+        UC_INFO("HAL peer mapping: owner={} device={} rank={} addr={} bytes={} va_offset=0",
+                owner_, deviceId_, rank, addr, rankStride_);
     }
     return Status::OK();
 }
@@ -311,7 +312,8 @@ void* DataStrategy::DataAt(size_t slotIdx) const
     if (nSlotsPerRank_ == 0) { return nullptr; }
     const size_t rank = slotIdx / nSlotsPerRank_;
     if (rank != owner_ || rank >= mappings_.size() || !mappings_[rank].mapped) { return nullptr; }
-    return RankAddress(rank) + (slotIdx % nSlotsPerRank_) * slotSize_;
+    return static_cast<std::byte*>(mappings_[rank].addr) +
+           (slotIdx % nSlotsPerRank_) * slotSize_;
 #else
     return nullptr;
 #endif
@@ -323,7 +325,8 @@ void* DataStrategy::DeviceDataAt(size_t slotIdx) const
     if (nSlotsPerRank_ == 0) { return nullptr; }
     const size_t rank = slotIdx / nSlotsPerRank_;
     if (rank == owner_ || rank >= mappings_.size() || !mappings_[rank].mapped) { return nullptr; }
-    return RankAddress(rank) + (slotIdx % nSlotsPerRank_) * slotSize_;
+    return static_cast<std::byte*>(mappings_[rank].addr) +
+           (slotIdx % nSlotsPerRank_) * slotSize_;
 #else
     return nullptr;
 #endif
