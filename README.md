@@ -9,6 +9,15 @@
 
 ## 编译
 
+### UCM 当前内存分配逻辑复现
+
+新增 [ucm_data_strategy](ucm_data_strategy/README.md)：原样保留 UCM DataStrategy 和 HAL 封装，每次运行只负责一个进程，发布句柄时打印、获取 peer 句柄时等待终端输入。支持指定 rank、device、rank 数、slot 大小、slot 数和 Setup 超时。
+
+```bash
+cmake -S ucm_data_strategy -B build/ucm_data_strategy -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/ucm_data_strategy --target data_strategy_demo -j
+```
+
 ### Host UVA 共享 demo
 
 `host_uva_share.cpp` 基于用户提供的文件，仅将 writer 和 reader 的 `halMemAddressReserve` 最后一个参数改为 `MEM_NORMAL_PAGE_TYPE`，其他源码内容保持不变。另行提供 `common.h` 中的 SDK includes、日志和错误检查宏。该文件使用 C++20 指定成员初始化，CMake 为这个目标单独启用 C++20。
