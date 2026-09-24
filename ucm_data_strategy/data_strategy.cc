@@ -102,12 +102,20 @@ Status DataStrategy::Setup(CtrlLayout& ctrl, int32_t deviceId, size_t myRank, si
 }
 
 #if UCM_RUNTIME_ASCEND_HAL
+std::byte* DataStrategy::RankAddress(size_t rank) const
+{
+    // Keep the local host mapping first, followed by peers in rank order.
+    size_t mappingIdx = rank < owner_ ? rank + 1 : rank;
+    if (rank == owner_) { mappingIdx = 0; }
+    return static_cast<std::byte*>(base_) + mappingIdx * rankStride_;
+}
+
 void DataStrategy::Reset()
 {
     // reset for map
     for (size_t rank = 0; rank < mappings_.size(); ++rank) {
         if (!mappings_[rank].mapped) { continue; }
-        std::byte* addr = static_cast<std::byte*>(base_) + rank * rankStride_;
+        std::byte* addr = RankAddress(rank);
         Status status = Hal::MemUnmap(addr);
         if (status.Failure()) {
             UC_ERROR("HAL unmap failed: owner={} device={} rank={} addr={} status={}", owner_,
@@ -196,7 +204,7 @@ Status DataStrategy::LocalSetup(size_t dataBytes, size_t nRanks, Hal::PageType p
             status);
         return status;
     }
-    std::byte* local = static_cast<std::byte*>(base_) + owner_ * rankStride_;
+    std::byte* local = RankAddress(owner_);
     status = Hal::MemMap(local, rankStride_, mappings_[owner_].handle);
     if (status.Failure()) {
         UC_ERROR(
@@ -207,6 +215,8 @@ Status DataStrategy::LocalSetup(size_t dataBytes, size_t nRanks, Hal::PageType p
         return status;
     }
     mappings_[owner_].mapped = true;
+    UC_INFO("HAL local mapping: owner={} device={} addr={} bytes={} va_offset=0", owner_,
+            deviceId_, static_cast<void*>(local), rankStride_);
     return Status::OK();
 }
 
@@ -268,7 +278,7 @@ Status DataStrategy::CrossRankSetup(CtrlLayout& ctrl, size_t timeoutMs)
             return {status.Underlying(),
                     fmt::format("HAL peer import failed: rank={} status={}", rank, status)};
         }
-        std::byte* addr = static_cast<std::byte*>(base_) + rank * rankStride_;
+        std::byte* addr = RankAddress(rank);
         status = Hal::MemMap(addr, rankStride_, mappings_[rank].handle);
         if (status.Failure()) {
             UC_ERROR(
@@ -301,8 +311,7 @@ void* DataStrategy::DataAt(size_t slotIdx) const
     if (nSlotsPerRank_ == 0) { return nullptr; }
     const size_t rank = slotIdx / nSlotsPerRank_;
     if (rank != owner_ || rank >= mappings_.size() || !mappings_[rank].mapped) { return nullptr; }
-    return static_cast<std::byte*>(base_) + rank * rankStride_ +
-           (slotIdx % nSlotsPerRank_) * slotSize_;
+    return RankAddress(rank) + (slotIdx % nSlotsPerRank_) * slotSize_;
 #else
     return nullptr;
 #endif
@@ -314,8 +323,7 @@ void* DataStrategy::DeviceDataAt(size_t slotIdx) const
     if (nSlotsPerRank_ == 0) { return nullptr; }
     const size_t rank = slotIdx / nSlotsPerRank_;
     if (rank == owner_ || rank >= mappings_.size() || !mappings_[rank].mapped) { return nullptr; }
-    return static_cast<std::byte*>(base_) + rank * rankStride_ +
-           (slotIdx % nSlotsPerRank_) * slotSize_;
+    return RankAddress(rank) + (slotIdx % nSlotsPerRank_) * slotSize_;
 #else
     return nullptr;
 #endif

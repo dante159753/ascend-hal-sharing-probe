@@ -47,6 +47,7 @@ class DataStrategy {
 
     Status LocalSetup(size_t dataBytes, size_t nRanks, Trans::Hal::PageType pageType);
     Status CrossRankSetup(CtrlLayout& ctrl, size_t timeoutMs);
+    std::byte* RankAddress(size_t rank) const;
     void Reset();
 #endif
 
