@@ -27,6 +27,7 @@
 #include <exception>
 #include <fmt/format.h>
 #include <new>
+#include <numeric>
 #include <thread>
 
 #if UCM_RUNTIME_ASCEND_HAL
@@ -105,22 +106,20 @@ Status DataStrategy::Setup(CtrlLayout& ctrl, int32_t deviceId, size_t myRank, si
 #if UCM_RUNTIME_ASCEND_HAL
 Status DataStrategy::ReserveRankAddress(size_t rank)
 {
-    constexpr size_t vaAlignment = Hal::kAddressAlignment;
-    const size_t reserveBytes = (rankStride_ + vaAlignment - 1) / vaAlignment * vaAlignment;
-    Status status = Hal::MemAddressReserve(&mappings_[rank].addr, reserveBytes);
+    Status status = Hal::MemAddressReserve(&mappings_[rank].addr, rankStride_);
     if (status.Failure()) {
         UC_ERROR(
             "halMemAddressReserve failed: owner={} device={} rank={} reserve_bytes={} status={}",
-            owner_, deviceId_, rank, reserveBytes, status);
+            owner_, deviceId_, rank, rankStride_, status);
         return status;
     }
     if (mappings_[rank].addr == nullptr) {
         UC_ERROR("Invalid HAL VA reservation: owner={} device={} rank={} reserve_bytes={}",
-                 owner_, deviceId_, rank, reserveBytes);
+                 owner_, deviceId_, rank, rankStride_);
         return Status::Error("HAL did not return a valid ptr");
     }
     UC_INFO("HAL VA reservation: owner={} device={} rank={} addr={} reserve_bytes={}",
-            owner_, deviceId_, rank, mappings_[rank].addr, reserveBytes);
+            owner_, deviceId_, rank, mappings_[rank].addr, rankStride_);
     return Status::OK();
 }
 
@@ -183,13 +182,13 @@ Status DataStrategy::LocalSetup(size_t dataBytes, size_t nRanks, Hal::PageType p
         return Status::Error(fmt::format("invalid HAL granularity({}) for data size({})",
                                          allocGranularity, dataBytes));
     }
-    rankStride_ = (dataBytes + allocGranularity - 1) / allocGranularity * allocGranularity;
+    const size_t allocationAlignment = std::lcm(vaAlignment, allocGranularity);
+    rankStride_ = (dataBytes + allocationAlignment - 1) / allocationAlignment * allocationAlignment;
     mappings_.resize(nRanks);
-    const size_t reserveBytes = (rankStride_ + vaAlignment - 1) / vaAlignment * vaAlignment;
     UC_INFO(
         "HAL host allocation: owner={} device={} ranks={} data_bytes={} "
         "rank_stride={} reserve_bytes_per_rank={} page_type={} alloc_granularity={}",
-        owner_, deviceId_, nRanks, dataBytes, rankStride_, reserveBytes,
+        owner_, deviceId_, nRanks, dataBytes, rankStride_, rankStride_,
         static_cast<uint32_t>(pageType), allocGranularity);
 
     status = ReserveRankAddress(owner_);

@@ -11,6 +11,8 @@
 
 每个进程为本地 Host 内存和每个 peer 的 Device 导入分别调用一次 `halMemAddressReserve`，Map 始终使用该次 Reserve 返回的起点。`mappings_[rank].addr` 保存该逻辑 rank 的实际 VA；不同 rank 的 VA 不要求连续。
 
+Reserve、Create、Map 三者长度统一使用 `rankStride`：将每 rank 的有效数据长度按 1 GiB 与 HAL `allocGranularity` 的最小公倍数向上取整。例如有效数据为 3 MiB 时，三者均为 1 GiB；原来三者已经都是 2 GiB 的用例不变。slot 大小及数量保持用户传入值，额外空间只用于分配对齐。
+
 例如 rank 1 进程有三个独立预留区：
 
 | 逻辑 rank | 地址 | 映射类型 |
@@ -83,7 +85,7 @@ cmake --build build/ucm_data_strategy --target data_strategy_demo -j
   --slot-size 8588328960 --slots-per-rank 1
 ```
 
-这里用单个大 slot 精确构造 `data_bytes=8588328960`。若驱动返回 `alloc_granularity=2097152`，则 `rank_stride=8589934592`、`reserve_bytes_per_rank=8589934592`。完整初始化后，每个进程有 8 次独立的 8 GiB VA 预留，总计 64 GiB，而不再是一次预留连续的 64 GiB。每段 Reserve 长度向上对齐到 1 GiB，Map 长度仍为 rankStride；日志打印每段 VA 和预留长度。
+这里用单个大 slot 精确构造 `data_bytes=8588328960`。若驱动返回 `alloc_granularity=2097152`，则 `rank_stride=8589934592`、`reserve_bytes_per_rank=8589934592`。完整初始化后，每个进程有 8 次独立的 8 GiB VA 预留，总计 64 GiB，而不再是一次预留连续的 64 GiB。Reserve、Create 和 Map 长度均为 rankStride；日志打印每段 VA 和预留长度。
 
 若只定位本地 Map 失败，启动这一个进程即可；若本地 Map 成功进入句柄交换，需要再启动其余 rank 并交换句柄。若要保持业务中的 slot 划分，也可直接传入业务的真实 slot-size 和 slots-per-rank。
 
@@ -94,3 +96,5 @@ cmake --build build/ucm_data_strategy --target data_strategy_demo -j
 同日首次调整布局后：重新编译通过，模拟检查覆盖 rank 0/1/2 的本地起点映射、peer 连续排列、逻辑 slot 地址查询以及部分 peer 映射失败时的清理；原有交互和失败回退检查也通过。此次验证未在 A5 实机运行。
 
 同日改为独立 Reserve 后：重新编译通过，模拟检查覆盖三个 owner 的独立 VA 起点映射、peer Reserve/Map 中途失败的清理，以及不连续 VA 下各 slot 的地址查询。另以每 rank 3 MiB 数据、4 MiB Map 长度、1 GiB Reserve 长度检查不同对齐长度的处理。原有双进程交互和失败回退检查也通过；待 A5 实机确认。
+
+同日统一长度后：编译和模拟检查通过；3 MiB 有效数据对应的 Reserve、Create、Map 长度均为 1 GiB，所有 Map 的长度严格等于对应预留区长度。slot 查询、双进程交互及失败清理检查通过；未在 A5 实机运行。
