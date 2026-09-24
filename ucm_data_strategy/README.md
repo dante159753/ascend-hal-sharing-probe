@@ -25,7 +25,9 @@ cmake -S ucm_data_strategy -B build/ucm_data_strategy \
 cmake --build build/ucm_data_strategy --target data_strategy_demo -j
 ```
 
-需要 Linux、C++17、CMake >= 3.18、CANN ACL/HAL 开发头文件和库。fmt 与 UCM 一致使用 11.2.0：优先使用已安装的兼容版本，否则 CMake 从 GitHub 下载。HAL 链接实际驱动目录，不搜索 toolkit devlib。运行时需挂载实际驱动和设备。
+需要 Linux、C++17、CMake >= 3.18、CANN ACL/HAL 开发头文件和库。构建不访问网络，也不需要安装 fmt：仓库自带 fmt 11.2.0 的三个必要头文件，以 `FMT_HEADER_ONLY` 编译，不下载或链接 fmt 库。HAL 链接实际驱动目录，不搜索 toolkit devlib。运行时需挂载实际驱动和设备。
+
+旧版在 `fmt-populate` 下载阶段失败时，更新源码后直接重新执行上面的配置和编译命令即可；无需完成旧下载。
 
 ## 两个进程手动交换句柄
 
