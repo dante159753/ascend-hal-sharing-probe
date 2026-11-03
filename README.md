@@ -9,6 +9,16 @@
 
 ## 编译
 
+### 单文件 Cache2 HAL AIO 文件系统诊断
+
+[cache2_hal_aio.cc](cache2_hal_aio.cc) 模拟 Cache2 的分片 dump/load：HAL 申请 Host 内存，Linux AIO 写入 `.tmp`，完成后 rename，再读回并逐字节校验。默认申请 2GiB、每次 I/O 为 8MiB，读写均开启 `O_DIRECT`；可用 `--direct 0` 对照 buffered AIO。日志记录调用参数、PID、耗时及错误码。
+
+该程序可单文件编译，不依赖 UCM、fmt、libaio 或本仓库其他源码，也不下载依赖。编译命令、可配置参数及故障定位方法见 [使用说明](cache2_hal_aio.md)。
+
+```bash
+./cache2_hal_aio --dir /mnt/custom-fs/test --device 0
+```
+
 ### UCM 当前内存分配逻辑复现
 
 新增 [ucm_data_strategy](ucm_data_strategy/README.md)：保留 UCM DataStrategy 对外接口和 HAL 封装，为每个 rank 的映射单独预留 VA，本地 Host 和 peer Device 内存都映射到各自 Reserve 返回的起点。每次运行只负责一个进程，发布句柄时打印、获取 peer 句柄时等待终端输入。支持指定 rank、device、rank 数、slot 大小、slot 数和 Setup 超时。
