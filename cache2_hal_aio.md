@@ -77,7 +77,9 @@ set -o pipefail
 - `ucm/store/posix/cc/io_engine_aio.h`：每个 shard 使用独立 buffer、文件 offset 为 `shard_index × slot_bytes`；检查完成字节数是否等于请求长度。
 - `ucm/store/posix/cc/space_layout.cc`：写 `.tmp`，所有 shard 完成并关闭 fd 后 rename 到正式文件，再重新打开执行 load。
 
-demo 只访问本进程拥有的 HAL host buffer，不导出/import peer device 映射，不做 NPU copy。CPU 填充确定性数据，dump 后将 buffer 每个字节改成期望值的反码，再 load 并逐字节校验。报错打印 block/shard/offset、actual 和 expected，最多打印前 16 个 mismatch，并统计总数。
+demo 只访问本进程拥有的 HAL host buffer，不导出/import peer device 映射，不做 NPU copy。CPU 填充每行 128 字节的可读文本，含 iteration、block、shard、slot_offset 和 buffer_offset，剩余位置填点号、末尾换行。字段记录该行起始位置；末行不足 128 字节时截断。dump 后将 buffer 填成 0xff，再 load 并逐字节校验。报错打印首个错误字节的位置与十六进制值，并并排给出该行 actual/expected 的完整内容；非可见字符转义为 `\xNN`，因此零字节和残留 0xff 也可见。最多打印前 16 条错误记录，仍统计所有错误字节。
+
+生成的文件可以直接用 `head -n 5 block-0` 检查内容。默认每轮使用不同的 iteration，方便识别上一轮的旧数据。
 
 这是存储 I/O 诊断程序，未复现控制块、load fd cache、跨进程调度和后台维护线程。每个阶段使用独立 AIO context、为各 shard 打开 fd，阶段完成后统一关闭；生产代码的 dump fd 在各自回调中关闭。日志较详细，不适合用结果评价生产性能。
 

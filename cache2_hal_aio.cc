@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
-// Standalone build/run instructions: cache2_hal_aio.md. No UCM or libaio dependency.
+// Standalone build/run instructions: cache2_hal_aio.md. No UCM or libaio
+// dependency.
 #include <acl/acl.h>
 #include <algorithm>
+#include <array>
 #include <ascend_hal.h>
 #include <atomic>
 #include <cerrno>
@@ -38,7 +40,7 @@ static double Milliseconds(Clock::time_point start)
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 }
 
-static void Log(const char* format, ...)
+static void Log(const char *format, ...)
 {
     std::lock_guard<std::mutex> lock(logMutex);
     std::printf("[pid=%d t=%.3fms] ", getpid(), Milliseconds(startTime));
@@ -51,7 +53,7 @@ static void Log(const char* format, ...)
 }
 
 template <typename F>
-static long Call(const char* expression, F fn, bool osCall)
+static long Call(const char *expression, F fn, bool osCall)
 {
     Log("  CALL %s", expression);
     const Clock::time_point begin = Clock::now();
@@ -73,7 +75,7 @@ static long Call(const char* expression, F fn, bool osCall)
     do {                                          \
         try {                                     \
             call;                                 \
-        } catch (const std::exception& error) {   \
+        } catch (const std::exception &error) {   \
             Log("CLEANUP FAIL %s", error.what()); \
             cleanupFailed = true;                 \
         }                                         \
@@ -100,8 +102,8 @@ struct HostMemory {
     bool deviceSet = false;
     bool mapped = false;
     int device = 0;
-    void* addr = nullptr;
-    drv_mem_handle_t* handle = nullptr;
+    void *addr = nullptr;
+    drv_mem_handle_t *handle = nullptr;
 
     void Release()
     {
@@ -134,7 +136,8 @@ struct HostMemory {
         prop.pg_type = huge ? MEM_HUGE_PAGE_TYPE : MEM_NORMAL_PAGE_TYPE;
         prop.mem_type = MEM_DDR_TYPE;
         size_t allocGranularity = 0;
-        Log("HAL prop side=%u devid=%u pg_type=%u mem_type=%u flags=0 data_bytes=%zu",
+        Log("HAL prop side=%u devid=%u pg_type=%u mem_type=%u flags=0 "
+            "data_bytes=%zu",
             unsigned(prop.side), unsigned(prop.devid), unsigned(prop.pg_type),
             unsigned(prop.mem_type), bytes);
         SDK(halMemGetAllocationGranularity(&prop, MEM_ALLOC_GRANULARITY_RECOMMENDED,
@@ -145,13 +148,14 @@ struct HostMemory {
         }
         const size_t alignment = std::lcm(vaAlignment, allocGranularity);
         const size_t rankStride = (bytes + alignment - 1) / alignment * alignment;
-        Log("HAL alloc_granularity=%zu rank_stride=%zu reserve_alignment=0 requested_addr=null",
+        Log("HAL alloc_granularity=%zu rank_stride=%zu reserve_alignment=0 "
+            "requested_addr=null",
             allocGranularity, rankStride);
         SDK(halMemAddressReserve(&addr, rankStride, 0, nullptr, 0));
         if (!addr) { throw std::runtime_error("null HAL reservation"); }
         Log("  reserved_addr=%p", addr);
         SDK(halMemCreate(&handle, rankStride, &prop, 0));
-        Log("  handle=%p map_addr=%p size=%zu offset=0 flags=0", static_cast<void*>(handle), addr,
+        Log("  handle=%p map_addr=%p size=%zu offset=0 flags=0", static_cast<void *>(handle), addr,
             rankStride);
         SDK(halMemMap(addr, rankStride, 0, handle, 0));
         mapped = true;
@@ -164,7 +168,8 @@ struct Request {
     bool done = false;
 };
 
-// Requests, descriptors and HAL memory must outlive io_destroy, including on failure.
+// Requests, descriptors and HAL memory must outlive io_destroy, including on
+// failure.
 class AioPhase {
     aio_context_t ctx_ = 0;
     int eventFd_ = -1;
@@ -181,14 +186,14 @@ public:
         stop_ = true;
         if (completion_.joinable()) { completion_.join(); }
         if (ctx_) { CLEANUP(OS(syscall(SYS_io_destroy, ctx_))); }
-        for (Request& req : requests_) {
+        for (Request &req : requests_) {
             if (req.fd >= 0) { CLEANUP(OS(close(req.fd))); }
         }
         if (epollFd_ >= 0) { CLEANUP(OS(close(epollFd_))); }
         if (eventFd_ >= 0) { CLEANUP(OS(close(eventFd_))); }
     }
 
-    void Run(const Options& opt, const std::vector<std::string>& paths, void* buffer, bool dump)
+    void Run(const Options &opt, const std::vector<std::string> &paths, void *buffer, bool dump)
     {
         const size_t count = opt.blocks * opt.shards;
         Log("PHASE %s requests=%zu slot_bytes=%zu depth=%zu timeout_ms=%zu", dump ? "DUMP" : "LOAD",
@@ -203,7 +208,7 @@ public:
         requests_.resize(count);
         const int flags = (dump ? O_CREAT | O_WRONLY : O_RDONLY) | (opt.direct ? O_DIRECT : 0);
         for (size_t i = 0; i < count; ++i) {
-            Request& req = requests_[i];
+            Request &req = requests_[i];
             Log("  open request=%zu block=%zu shard=%zu path=%s flags=0x%x mode=0644", i,
                 i / opt.shards, i % opt.shards, paths[i / opt.shards].c_str(), flags);
             req.fd = OS(open(paths[i / opt.shards].c_str(), flags, 0644));
@@ -247,7 +252,7 @@ public:
                         return;
                     }
                     for (long j = 0; j < n; ++j) {
-                        const io_event& ev = events[j];
+                        const io_event &ev = events[j];
                         const size_t id = ev.data;
                         if (id >= requests_.size() || requests_[id].done ||
                             ev.obj != reinterpret_cast<uintptr_t>(&requests_[id].cb)) {
@@ -257,7 +262,7 @@ public:
                             failed_ = true;
                             return;
                         }
-                        Request& req = requests_[id];
+                        Request &req = requests_[id];
                         const int error = ev.res < 0 ? static_cast<int>(-ev.res) : 0;
                         Log("  complete request=%zu block=%zu shard=%zu fd=%d offset=%lld "
                             "res=%lld expected=%zu res2=%lld error=%d(%s)",
@@ -285,7 +290,8 @@ public:
                 throw std::runtime_error("AIO completion failed (see res/errno above)");
             }
             if (Clock::now() >= deadline) {
-                Log("FAIL AIO timeout submitted=%zu completed=%zu; io_destroy may wait for the FS",
+                Log("FAIL AIO timeout submitted=%zu completed=%zu; io_destroy may wait "
+                    "for the FS",
                     submitted, completed_.load());
                 throw std::runtime_error("AIO phase timed out");
             }
@@ -296,8 +302,9 @@ public:
                 std::this_thread::sleep_for(std::chrono::microseconds(200));
                 continue;
             }
-            iocb* cb = &requests_[submitted].cb;
-            Log("  io_submit request=%zu ctx=%llu nr=1 fd=%u opcode=%u buf=0x%llx bytes=%llu "
+            iocb *cb = &requests_[submitted].cb;
+            Log("  io_submit request=%zu ctx=%llu nr=1 fd=%u opcode=%u buf=0x%llx "
+                "bytes=%llu "
                 "offset=%lld flags=%u resfd=%u",
                 submitted, static_cast<unsigned long long>(ctx_), cb->aio_fildes,
                 cb->aio_lio_opcode, static_cast<unsigned long long>(cb->aio_buf),
@@ -325,7 +332,7 @@ public:
         completion_.join();
         Log("PHASE %s PASS bytes=%zu elapsed_ms=%.3f", dump ? "DUMP" : "LOAD",
             count * opt.slotBytes, Milliseconds(begin));
-        for (Request& req : requests_) {
+        for (Request &req : requests_) {
             const int fd = req.fd;
             req.fd = -1;
             OS(close(fd));
@@ -333,7 +340,7 @@ public:
     }
 };
 
-static void Transfer(const Options& opt, const std::vector<std::string>& paths, uint8_t* buffer,
+static void Transfer(const Options &opt, const std::vector<std::string> &paths, uint8_t *buffer,
                      bool dump)
 {
     if (opt.engine == "aio") {
@@ -356,9 +363,9 @@ static void Transfer(const Options& opt, const std::vector<std::string>& paths, 
                 }
                 for (size_t pos = 0; pos < opt.slotBytes; pos += bytes) {
                     const off_t offset = shard * opt.slotBytes + pos;
-                    uint8_t* addr = buffer + block * opt.shards * opt.slotBytes + offset;
+                    uint8_t *addr = buffer + block * opt.shards * opt.slotBytes + offset;
                     Log("  %s block=%zu shard=%zu fd=%d buf=%p bytes=%zu offset=%lld",
-                        dump ? "pwrite" : "pread", block, shard, fd, static_cast<void*>(addr),
+                        dump ? "pwrite" : "pread", block, shard, fd, static_cast<void *>(addr),
                         bytes, static_cast<long long>(offset));
                     const long n = dump ? OS(pwrite(fd, addr, bytes, offset))
                                         : OS(pread(fd, addr, bytes, offset));
@@ -381,16 +388,42 @@ static void Transfer(const Options& opt, const std::vector<std::string>& paths, 
     Log("PHASE psync %s PASS elapsed_ms=%.3f", dump ? "DUMP" : "LOAD", Milliseconds(start));
 }
 
-static uint8_t Pattern(size_t offset, size_t iteration)
+static std::array<char, 128> TextRecord(size_t offset, size_t iteration, const Options &opt)
 {
-    uint64_t value = (offset >> 3) + iteration * 0x9e3779b97f4a7c15ULL;
-    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
-    value ^= value >> 31;
-    return static_cast<uint8_t>(value >> ((offset & 7) * 8));
+    std::array<char, 128> record;
+    record.fill('.');
+    const int n =
+        std::snprintf(record.data(), record.size(),
+                      "UCM iter=%012zu block=%012zu shard=%012zu "
+                      "slot_offset=%012zu buffer_offset=%012zu | ",
+                      iteration, offset / opt.slotBytes / opt.shards,
+                      offset / opt.slotBytes % opt.shards, offset % opt.slotBytes, offset);
+    if (n < 0 || static_cast<size_t>(n) >= record.size()) {
+        throw std::runtime_error("text record overflow");
+    }
+    record[n] = '.';
+    record.back() = '\n';
+    return record;
 }
 
-int main(int argc, char** argv)
+static std::string DisplayBytes(const void *data, size_t size)
+{
+    const uint8_t *bytes = static_cast<const uint8_t *>(data);
+    std::string text;
+    for (size_t i = 0; i < size; ++i) {
+        const uint8_t c = bytes[i];
+        if (c >= 32 && c <= 126 && c != '\\' && c != '"') {
+            text.push_back(static_cast<char>(c));
+        } else {
+            char escaped[5];
+            std::snprintf(escaped, sizeof(escaped), "\\x%02x", unsigned(c));
+            text += escaped;
+        }
+    }
+    return text;
+}
+
+int main(int argc, char **argv)
 {
     try {
         Options opt;
@@ -398,11 +431,15 @@ int main(int argc, char** argv)
             const std::string key = argv[i];
             if (key == "--help") {
                 std::puts(
-                    "Usage: cache2_hal_aio --dir EXISTING_DIR [--device 0] [--blocks 8] "
-                    "[--shards 32] [--slot-bytes 8388608] [--engine aio|psync] [--tensor-bytes N] "
+                    "Usage: cache2_hal_aio --dir EXISTING_DIR [--device 0] "
+                    "[--blocks 8] "
+                    "[--shards 32] [--slot-bytes 8388608] [--engine aio|psync] "
+                    "[--tensor-bytes N] "
                     "[--depth 32] [--iterations 2] "
-                    "[--timeout-ms 60000] [--pages auto|normal|huge] [--direct 0|1] [--sync 0|1]\n"
-                    "Default: 2 GiB HAL buffer, Linux AIO with O_DIRECT, files retained. "
+                    "[--timeout-ms 60000] [--pages auto|normal|huge] [--direct "
+                    "0|1] [--sync 0|1]\n"
+                    "Default: 2 GiB HAL buffer, Linux AIO with O_DIRECT, files "
+                    "retained. "
                     "See cache2_hal_aio.md for build instructions.");
                 return 0;
             }
@@ -464,7 +501,8 @@ int main(int argc, char** argv)
         if (!mkdtemp(runTemplate.data())) {
             throw std::runtime_error("mkdtemp: " + std::string(strerror(errno)));
         }
-        Log("RUN dir=%s device=%d bytes=%zu blocks=%zu shards=%zu slot_bytes=%zu engine=%s direct=%d sync=%d",
+        Log("RUN dir=%s device=%d bytes=%zu blocks=%zu shards=%zu slot_bytes=%zu "
+            "engine=%s direct=%d sync=%d",
             runTemplate.c_str(), opt.device, bytes, opt.blocks, opt.shards, opt.slotBytes,
             opt.engine.c_str(), opt.direct, opt.sync);
         struct statfs fs{};
@@ -480,16 +518,22 @@ int main(int argc, char** argv)
             memory.deviceSet = true;
             try {
                 memory.Allocate(bytes, opt.pages != "normal");
-            } catch (const std::exception& error) {
+            } catch (const std::exception &error) {
                 if (opt.pages != "auto") { throw; }
                 Log("HAL huge allocation failed: %s; retry normal pages", error.what());
                 memory.Release();
                 memory.Allocate(bytes, false);
             }
-            uint8_t* buffer = static_cast<uint8_t*>(memory.addr);
+            uint8_t *buffer = static_cast<uint8_t *>(memory.addr);
             for (size_t iteration = 0; iteration < opt.iterations; ++iteration) {
                 Log("ITERATION %zu CPU fill bytes=%zu addr=%p", iteration, bytes, memory.addr);
-                for (size_t i = 0; i < bytes; ++i) { buffer[i] = Pattern(i, iteration); }
+                for (size_t offset = 0; offset < bytes; offset += 128) {
+                    const std::array<char, 128> record = TextRecord(offset, iteration, opt);
+                    std::memcpy(buffer + offset, record.data(),
+                                std::min(record.size(), bytes - offset));
+                }
+                Log("  text sample=\"%s\"",
+                    DisplayBytes(buffer, std::min(size_t{128}, bytes)).c_str());
                 std::vector<std::string> temporary;
                 std::vector<std::string> archived;
                 for (size_t block = 0; block < opt.blocks; ++block) {
@@ -521,18 +565,30 @@ int main(int argc, char** argv)
                     }
                 }
                 Log("CPU poison buffer before LOAD bytes=%zu", bytes);
-                for (size_t i = 0; i < bytes; ++i) { buffer[i] = Pattern(i, iteration) ^ 0xff; }
+                std::memset(buffer, 0xff, bytes);
                 Transfer(opt, archived, buffer, false);
                 size_t mismatches = 0;
-                for (size_t i = 0; i < bytes; ++i) {
-                    const uint8_t expected = Pattern(i, iteration);
-                    if (buffer[i] == expected) { continue; }
-                    if (mismatches++ < 16) {
+                size_t printed = 0;
+                for (size_t offset = 0; offset < bytes; offset += 128) {
+                    const std::array<char, 128> record = TextRecord(offset, iteration, opt);
+                    const size_t length = std::min(record.size(), bytes - offset);
+                    size_t first = length;
+                    for (size_t j = 0; j < length; ++j) {
+                        if (buffer[offset + j] == static_cast<uint8_t>(record[j])) { continue; }
+                        if (first == length) { first = j; }
+                        ++mismatches;
+                    }
+                    if (first != length && printed++ < 16) {
+                        const size_t i = offset + first;
                         Log("MISMATCH iteration=%zu block=%zu shard=%zu slot_offset=%zu "
                             "buffer_offset=%zu actual=0x%02x expected=0x%02x",
                             iteration, i / opt.slotBytes / opt.shards,
                             (i / opt.slotBytes) % opt.shards, i % opt.slotBytes, i,
-                            unsigned(buffer[i]), unsigned(expected));
+                            unsigned(buffer[i]), unsigned(static_cast<uint8_t>(record[first])));
+                        Log("  record_offset=%zu length=%zu first_diff_in_record=%zu", offset,
+                            length, first);
+                        Log("  actual  =\"%s\"", DisplayBytes(buffer + offset, length).c_str());
+                        Log("  expected=\"%s\"", DisplayBytes(record.data(), length).c_str());
                     }
                 }
                 if (mismatches) {
@@ -544,7 +600,7 @@ int main(int argc, char** argv)
         if (cleanupFailed) { throw std::runtime_error("resource cleanup failed"); }
         Log("RESULT PASS; retained files: %s", runTemplate.c_str());
         return 0;
-    } catch (const std::exception& error) {
+    } catch (const std::exception &error) {
         Log("RESULT FAIL: %s", error.what());
         return 1;
     }
