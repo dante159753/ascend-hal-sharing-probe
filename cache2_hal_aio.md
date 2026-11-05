@@ -23,6 +23,15 @@ export LD_LIBRARY_PATH="$DRIVER/lib64/driver:$ASCEND/lib64:${LD_LIBRARY_PATH:-}"
 
 ## 执行
 
+`--engine aio`（默认）和 `--engine psync` 共用 HAL buffer、文件提交和校验流程，均可指定 `--direct 1`（默认）或 `--direct 0`。例如：
+
+```bash
+./cache2_hal_aio --dir /mnt/custom-fs/test --engine psync --direct 1 --tensor-bytes 1048576
+./cache2_hal_aio --dir /mnt/custom-fs/test --engine psync --direct 0 --tensor-bytes 1048576
+```
+
+psync 按 UCM `TransQueue::H2S/S2H` 的访问粒度执行同步 `pwrite/pread`：每个 shard 从 `shard_index × slot_bytes` 开始，按 tensor 大小递增偏移。默认每个 shard 一次调用；`--tensor-bytes` 仅用于 psync，必须整除 slot 大小。dump 为每个 shard 打开和关闭临时文件，load 在同一 block 内复用读 fd。短读写直接报错。demo 串行执行 psync，不模拟生产线程池；`--depth`、`--timeout-ms` 只作用于 AIO。`--sync` 是另一个独立选项，表示是否在提交文件前调用 `fdatasync`。
+
 `--dir` 指向已经存在的目标文件系统目录。每次运行会创建独立的 `cache2-hal-aio-XXXXXX` 子目录，不覆盖已有业务文件。文件无论成功或失败都会保留，以便检查；成功时默认占用约 2GB 磁盘空间。
 
 ```bash

@@ -17,6 +17,7 @@
 
 ```bash
 ./cache2_hal_aio --dir /mnt/custom-fs/test --device 0
+./cache2_hal_aio --dir /mnt/custom-fs/test --engine psync --direct 1
 ```
 
 ### UCM 当前内存分配逻辑复现

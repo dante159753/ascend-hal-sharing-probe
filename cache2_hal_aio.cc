@@ -90,6 +90,8 @@ struct Options {
     size_t timeoutMs = 60000;
     std::string pages = "auto";
     bool direct = true;
+    std::string engine = "aio";
+    size_t tensorBytes = 0;
     bool sync = false;
 };
 
@@ -331,6 +333,54 @@ public:
     }
 };
 
+static void Transfer(const Options& opt, const std::vector<std::string>& paths, uint8_t* buffer,
+                     bool dump)
+{
+    if (opt.engine == "aio") {
+        AioPhase phase;
+        phase.Run(opt, paths, buffer, dump);
+        return;
+    }
+    const int flags = (dump ? O_CREAT | O_WRONLY : O_RDONLY) | (opt.direct ? O_DIRECT : 0);
+    const size_t bytes = opt.tensorBytes ? opt.tensorBytes : opt.slotBytes;
+    const Clock::time_point start = Clock::now();
+    Log("PHASE psync %s tensor_bytes=%zu flags=0x%x", dump ? "DUMP" : "LOAD", bytes, flags);
+    for (size_t block = 0; block < opt.blocks; ++block) {
+        int fd = -1;
+        try {
+            for (size_t shard = 0; shard < opt.shards; ++shard) {
+                if (fd < 0) {
+                    Log("  open block=%zu shard=%zu path=%s flags=0x%x", block, shard,
+                        paths[block].c_str(), flags);
+                    fd = OS(open(paths[block].c_str(), flags, 0644));
+                }
+                for (size_t pos = 0; pos < opt.slotBytes; pos += bytes) {
+                    const off_t offset = shard * opt.slotBytes + pos;
+                    uint8_t* addr = buffer + block * opt.shards * opt.slotBytes + offset;
+                    Log("  %s block=%zu shard=%zu fd=%d buf=%p bytes=%zu offset=%lld",
+                        dump ? "pwrite" : "pread", block, shard, fd, static_cast<void*>(addr),
+                        bytes, static_cast<long long>(offset));
+                    const long n = dump ? OS(pwrite(fd, addr, bytes, offset))
+                                        : OS(pread(fd, addr, bytes, offset));
+                    if (n != static_cast<long>(bytes)) {
+                        throw std::runtime_error("short psync I/O: actual=" + std::to_string(n) +
+                                                 " expected=" + std::to_string(bytes));
+                    }
+                }
+                if (dump || shard + 1 == opt.shards) {
+                    const int closing = fd;
+                    fd = -1;
+                    OS(close(closing));
+                }
+            }
+        } catch (...) {
+            if (fd >= 0) { CLEANUP(OS(close(fd))); }
+            throw;
+        }
+    }
+    Log("PHASE psync %s PASS elapsed_ms=%.3f", dump ? "DUMP" : "LOAD", Milliseconds(start));
+}
+
 static uint8_t Pattern(size_t offset, size_t iteration)
 {
     uint64_t value = (offset >> 3) + iteration * 0x9e3779b97f4a7c15ULL;
@@ -349,7 +399,8 @@ int main(int argc, char** argv)
             if (key == "--help") {
                 std::puts(
                     "Usage: cache2_hal_aio --dir EXISTING_DIR [--device 0] [--blocks 8] "
-                    "[--shards 32] [--slot-bytes 8388608] [--depth 32] [--iterations 2] "
+                    "[--shards 32] [--slot-bytes 8388608] [--engine aio|psync] [--tensor-bytes N] "
+                    "[--depth 32] [--iterations 2] "
                     "[--timeout-ms 60000] [--pages auto|normal|huge] [--direct 0|1] [--sync 0|1]\n"
                     "Default: 2 GiB HAL buffer, Linux AIO with O_DIRECT, files retained. "
                     "See cache2_hal_aio.md for build instructions.");
@@ -357,6 +408,10 @@ int main(int argc, char** argv)
             }
             if (++i >= argc) { throw std::runtime_error("missing value for " + key); }
             const std::string value = argv[i];
+            if (key == "--engine") {
+                opt.engine = value;
+                continue;
+            }
             if (key == "--dir") {
                 opt.dir = value;
                 continue;
@@ -380,6 +435,8 @@ int main(int argc, char** argv)
                 opt.slotBytes = number;
             } else if (key == "--depth") {
                 opt.depth = number;
+            } else if (key == "--tensor-bytes" && number > 0) {
+                opt.tensorBytes = number;
             } else if (key == "--iterations") {
                 opt.iterations = number;
             } else if (key == "--timeout-ms") {
@@ -395,6 +452,8 @@ int main(int argc, char** argv)
         constexpr size_t maxBytes = 1ULL << 40;
         if (opt.dir.empty() || !opt.blocks || !opt.shards || !opt.slotBytes || !opt.depth ||
             !opt.iterations || !opt.timeoutMs || opt.depth > INT32_MAX ||
+            (opt.engine != "aio" && opt.engine != "psync") ||
+            (opt.tensorBytes && (opt.engine != "psync" || opt.slotBytes % opt.tensorBytes)) ||
             opt.blocks > maxBytes / opt.shards ||
             opt.blocks * opt.shards > maxBytes / opt.slotBytes ||
             (opt.pages != "auto" && opt.pages != "normal" && opt.pages != "huge")) {
@@ -405,9 +464,9 @@ int main(int argc, char** argv)
         if (!mkdtemp(runTemplate.data())) {
             throw std::runtime_error("mkdtemp: " + std::string(strerror(errno)));
         }
-        Log("RUN dir=%s device=%d bytes=%zu blocks=%zu shards=%zu slot_bytes=%zu direct=%d sync=%d",
+        Log("RUN dir=%s device=%d bytes=%zu blocks=%zu shards=%zu slot_bytes=%zu engine=%s direct=%d sync=%d",
             runTemplate.c_str(), opt.device, bytes, opt.blocks, opt.shards, opt.slotBytes,
-            opt.direct, opt.sync);
+            opt.engine.c_str(), opt.direct, opt.sync);
         struct statfs fs{};
         OS(statfs(runTemplate.c_str(), &fs));
         Log("FILESYSTEM type=0x%lx block_size=%ld", static_cast<unsigned long>(fs.f_type),
@@ -437,10 +496,7 @@ int main(int argc, char** argv)
                     archived.push_back(runTemplate + "/block-" + std::to_string(block));
                     temporary.push_back(archived.back() + ".tmp");
                 }
-                {
-                    AioPhase dump;
-                    dump.Run(opt, temporary, buffer, true);
-                }
+                Transfer(opt, temporary, buffer, true);
                 for (size_t block = 0; block < opt.blocks; ++block) {
                     if (opt.sync) {
                         Log("SYNC path=%s", temporary[block].c_str());
@@ -466,10 +522,7 @@ int main(int argc, char** argv)
                 }
                 Log("CPU poison buffer before LOAD bytes=%zu", bytes);
                 for (size_t i = 0; i < bytes; ++i) { buffer[i] = Pattern(i, iteration) ^ 0xff; }
-                {
-                    AioPhase load;
-                    load.Run(opt, archived, buffer, false);
-                }
+                Transfer(opt, archived, buffer, false);
                 size_t mismatches = 0;
                 for (size_t i = 0; i < bytes; ++i) {
                     const uint8_t expected = Pattern(i, iteration);
