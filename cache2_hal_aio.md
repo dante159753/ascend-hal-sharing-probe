@@ -32,7 +32,7 @@ export LD_LIBRARY_PATH="$DRIVER/lib64/driver:$ASCEND/lib64:${LD_LIBRARY_PATH:-}"
 
 psync 按 UCM `TransQueue::H2S/S2H` 的访问粒度执行同步 `pwrite/pread`：每个 shard 从 `shard_index × slot_bytes` 开始，按 tensor 大小递增偏移。默认每个 shard 一次调用；`--tensor-bytes` 仅用于 psync，必须整除 slot 大小。dump 为每个 shard 打开和关闭临时文件，load 在同一 block 内复用读 fd。短读写直接报错。demo 串行执行 psync，不模拟生产线程池；`--depth`、`--timeout-ms` 只作用于 AIO。`--sync` 是另一个独立选项，表示是否在提交文件前调用 `fdatasync`。
 
-`--dir` 指向已经存在的目标文件系统目录。每次运行会创建独立的 `cache2-hal-aio-XXXXXX` 子目录，不覆盖已有业务文件。文件无论成功或失败都会保留，以便检查；成功时默认占用约 2GB 磁盘空间。
+`--dir` 指向已经存在的目标文件系统目录。每次运行会创建独立的 `cache2-hal-aio-XXXXXX` 子目录，不覆盖已有业务文件。默认无论成功或失败都会保留文件，以便检查（`--keep-files 1`）；使用 `--keep-files 0` 可在成功后清理；成功时默认占用约 2GB 磁盘空间。
 
 ```bash
 set -o pipefail
@@ -56,6 +56,7 @@ set -o pipefail
 | `--pages` | auto | 大页失败后释放资源并回退普通页；也可指定 `normal` 或 `huge` |
 | `--direct` | 1 | 读写文件都使用 `O_DIRECT`；设为 0 可对比 buffered AIO |
 | `--sync` | 0 | 设为 1 时，在写完成后、rename 前额外调用 `fdatasync` |
+| `--keep-files` | 1 | 保留生成的文件；设为 0 时，仅在所有轮次校验通过后删除本次文件及运行子目录；失败时仍保留 |
 
 有效数据大小为 `blocks × shards × slot-bytes`，默认正好 2GiB。HAL 实际 reserve/create/map 长度按 `lcm(1GiB, allocGranularity)` 向上对齐。即使只测几个小 shard，HAL 也至少申请 1GiB，以保留分支内的分配规则。
 

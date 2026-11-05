@@ -95,6 +95,7 @@ struct Options {
     std::string engine = "aio";
     size_t tensorBytes = 0;
     bool sync = false;
+    bool keepFiles = true;
 };
 
 struct HostMemory {
@@ -437,7 +438,7 @@ int main(int argc, char **argv)
                     "[--tensor-bytes N] "
                     "[--depth 32] [--iterations 2] "
                     "[--timeout-ms 60000] [--pages auto|normal|huge] [--direct "
-                    "0|1] [--sync 0|1]\n"
+                    "0|1] [--sync 0|1] [--keep-files 0|1]\n"
                     "Default: 2 GiB HAL buffer, Linux AIO with O_DIRECT, files "
                     "retained. "
                     "See cache2_hal_aio.md for build instructions.");
@@ -482,6 +483,8 @@ int main(int argc, char **argv)
                 opt.direct = number;
             } else if (key == "--sync" && number <= 1) {
                 opt.sync = number;
+            } else if (key == "--keep-files" && number <= 1) {
+                opt.keepFiles = number;
             } else {
                 throw std::runtime_error("unknown option or invalid value: " + key);
             }
@@ -598,7 +601,17 @@ int main(int argc, char **argv)
             }
         }
         if (cleanupFailed) { throw std::runtime_error("resource cleanup failed"); }
-        Log("RESULT PASS; retained files: %s", runTemplate.c_str());
+        if (opt.keepFiles) {
+            Log("RESULT PASS; retained files: %s", runTemplate.c_str());
+        } else {
+            Log("CLEANUP generated files in %s", runTemplate.c_str());
+            for (size_t block = 0; block < opt.blocks; ++block) {
+                const std::string path = runTemplate + "/block-" + std::to_string(block);
+                OS(unlink(path.c_str()));
+            }
+            OS(rmdir(runTemplate.c_str()));
+            Log("RESULT PASS; generated files removed");
+        }
         return 0;
     } catch (const std::exception &error) {
         Log("RESULT FAIL: %s", error.what());
