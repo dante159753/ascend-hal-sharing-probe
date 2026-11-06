@@ -23,6 +23,15 @@ export LD_LIBRARY_PATH="$DRIVER/lib64/driver:$ASCEND/lib64:${LD_LIBRARY_PATH:-}"
 
 ## 执行
 
+`--memory hal|malloc` 选择内存来源，默认 `hal`。malloc 模式调用普通 `malloc(bytes + 4095)`，从返回区域中取 4KB 对齐的 I/O 地址，结束时 `free` 原始指针，不初始化 ACL/HAL；日志同时显示原始指针和 I/O 地址。它不会按 HAL 的 1GiB 粒度扩大分配，`--pages` 和 `--device` 不影响 malloc 模式。两种模式使用相同的读写和校验流程：
+
+```bash
+./cache2_hal_aio --dir /mnt/custom-fs/test --engine aio --memory malloc --direct 1
+./cache2_hal_aio --dir /mnt/custom-fs/test --engine psync --memory malloc --direct 0
+```
+
+malloc 模式仍需使用同一编译命令链接 SDK（程序包含 HAL 模式）。4KB 地址对齐不替代文件系统对 I/O 长度、offset 的对齐要求；不满足时直接报告错误，不自动关闭 Direct I/O。
+
 `--engine aio`（默认）和 `--engine psync` 共用 HAL buffer、文件提交和校验流程，均可指定 `--direct 1`（默认）或 `--direct 0`。例如：
 
 ```bash

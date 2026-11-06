@@ -93,12 +93,14 @@ struct Options {
     std::string pages = "auto";
     bool direct = true;
     std::string engine = "aio";
+    std::string memoryType = "hal";
     size_t tensorBytes = 0;
     bool sync = false;
     bool keepFiles = true;
 };
 
 struct HostMemory {
+    void* mallocBase = nullptr;
     bool initialized = false;
     bool deviceSet = false;
     bool mapped = false;
@@ -108,6 +110,13 @@ struct HostMemory {
 
     void Release()
     {
+        if (mallocBase) {
+            Log("  free malloc_base=%p io_addr=%p", mallocBase, addr);
+            std::free(mallocBase);
+            mallocBase = nullptr;
+            addr = nullptr;
+            return;
+        }
         if (mapped) {
             SDK(halMemUnmap(addr));
             mapped = false;
@@ -434,7 +443,7 @@ int main(int argc, char **argv)
                 std::puts(
                     "Usage: cache2_hal_aio --dir EXISTING_DIR [--device 0] "
                     "[--blocks 8] "
-                    "[--shards 32] [--slot-bytes 8388608] [--engine aio|psync] "
+                    "[--shards 32] [--slot-bytes 8388608] [--engine aio|psync] [--memory hal|malloc] "
                     "[--tensor-bytes N] "
                     "[--depth 32] [--iterations 2] "
                     "[--timeout-ms 60000] [--pages auto|normal|huge] [--direct "
@@ -446,6 +455,10 @@ int main(int argc, char **argv)
             }
             if (++i >= argc) { throw std::runtime_error("missing value for " + key); }
             const std::string value = argv[i];
+            if (key == "--memory") {
+                opt.memoryType = value;
+                continue;
+            }
             if (key == "--engine") {
                 opt.engine = value;
                 continue;
@@ -493,6 +506,7 @@ int main(int argc, char **argv)
         if (opt.dir.empty() || !opt.blocks || !opt.shards || !opt.slotBytes || !opt.depth ||
             !opt.iterations || !opt.timeoutMs || opt.depth > INT32_MAX ||
             (opt.engine != "aio" && opt.engine != "psync") ||
+            (opt.memoryType != "hal" && opt.memoryType != "malloc") ||
             (opt.tensorBytes && (opt.engine != "psync" || opt.slotBytes % opt.tensorBytes)) ||
             opt.blocks > maxBytes / opt.shards ||
             opt.blocks * opt.shards > maxBytes / opt.slotBytes ||
@@ -505,27 +519,38 @@ int main(int argc, char **argv)
             throw std::runtime_error("mkdtemp: " + std::string(strerror(errno)));
         }
         Log("RUN dir=%s device=%d bytes=%zu blocks=%zu shards=%zu slot_bytes=%zu "
-            "engine=%s direct=%d sync=%d",
+            "engine=%s memory=%s direct=%d sync=%d",
             runTemplate.c_str(), opt.device, bytes, opt.blocks, opt.shards, opt.slotBytes,
-            opt.engine.c_str(), opt.direct, opt.sync);
+            opt.engine.c_str(), opt.memoryType.c_str(), opt.direct, opt.sync);
         struct statfs fs{};
         OS(statfs(runTemplate.c_str(), &fs));
         Log("FILESYSTEM type=0x%lx block_size=%ld", static_cast<unsigned long>(fs.f_type),
             static_cast<long>(fs.f_bsize));
         {
             HostMemory memory;
-            memory.device = opt.device;
-            SDK(aclInit(nullptr));
-            memory.initialized = true;
-            SDK(aclrtSetDevice(opt.device));
-            memory.deviceSet = true;
-            try {
-                memory.Allocate(bytes, opt.pages != "normal");
-            } catch (const std::exception &error) {
-                if (opt.pages != "auto") { throw; }
-                Log("HAL huge allocation failed: %s; retry normal pages", error.what());
-                memory.Release();
-                memory.Allocate(bytes, false);
+            if (opt.memoryType == "malloc") {
+                constexpr size_t alignment = 4096;
+                Log("  malloc bytes=%zu io_bytes=%zu alignment=%zu", bytes + alignment - 1,
+                    bytes, alignment);
+                memory.mallocBase = std::malloc(bytes + alignment - 1);
+                if (!memory.mallocBase) { throw std::runtime_error("malloc failed"); }
+                const uintptr_t base = reinterpret_cast<uintptr_t>(memory.mallocBase);
+                memory.addr = reinterpret_cast<void*>((base + alignment - 1) & ~(alignment - 1));
+                Log("  malloc_base=%p io_addr=%p", memory.mallocBase, memory.addr);
+            } else {
+                memory.device = opt.device;
+                SDK(aclInit(nullptr));
+                memory.initialized = true;
+                SDK(aclrtSetDevice(opt.device));
+                memory.deviceSet = true;
+                try {
+                    memory.Allocate(bytes, opt.pages != "normal");
+                } catch (const std::exception &error) {
+                    if (opt.pages != "auto") { throw; }
+                    Log("HAL huge allocation failed: %s; retry normal pages", error.what());
+                    memory.Release();
+                    memory.Allocate(bytes, false);
+                }
             }
             uint8_t *buffer = static_cast<uint8_t *>(memory.addr);
             for (size_t iteration = 0; iteration < opt.iterations; ++iteration) {
